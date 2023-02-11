@@ -16,6 +16,25 @@ def clean_header (string):
     string = re.sub(r"=*", "", string )
     return string
 
+def wiki_parser(text):
+
+# split into headings and body text
+    headings = []
+    body_texts = []
+    lines = text.split('\n')
+    for line in lines:
+        if line.startswith('=='):
+            headings.append(line)
+        else:
+            body_texts.append(line)
+
+# create the dict
+    wiki_dict = {}
+    for h, b in zip(headings, body_texts):
+        wiki_dict[h] = b
+
+# return the dict
+    return wiki_dict
 
 rssheader = """<?xml version="1.0"?><rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0">
 <channel>
@@ -27,20 +46,14 @@ rssheader = """<?xml version="1.0"?><rss xmlns:atom="http://www.w3.org/2005/Atom
 
 print (rssheader)
 
-# It would be better to do this as a single request
-# and separate it into sections to avoid Wikimedia rate limiting. 
-basestring = "https://en.wikipedia.org/wiki/Wikipedia:Spoken_articles?action=raw&section="
+basestring = "https://en.wikipedia.org/wiki/Wikipedia:Spoken_articles?action=raw"
+wikitext = get_web_page ( basestring )
+wikitext = wikitext.split('==', 1)[1] # toss the header
+wikisections = wiki_parser ( wikitext )
+
 section_count = 0
-while True:
-    section_count+=1
-    sectiontext = get_web_page ( basestring + str ( section_count ) )
-    sectiontext = clean_braces_and_comments (sectiontext)
-    lines = sectiontext.split('\n')
-    header = lines[0]
-    wikitext = '\n'.join(lines[1:])
-    # this API endpoint includes subheadings with a heading. But it *also* returns those subheadings
-    # in order as part of their own integer as we count through. So lopping off any subheadings appearing here.
-    wikitext = re.findall(r"[^==]*", wikitext)[0]
+for header, sectiontext in wikisections.items():
+    wikitext = clean_braces_and_comments (wikitext)
     print ( str ( section_count) +" "+ header ,  file=sys.stderr )
     if ( "=See also=" in header  ) or ( "=External links=" in header ): break
     # if section_count > 5: continue # for testing
@@ -78,7 +91,7 @@ while True:
         if ( bad_listing ): continue
         url = f'https://en.wikipedia.org/w/api.php?action=query&prop=extracts&titles={article_normalized}&exsentences=1&explaintext=1&format=json'
         response = requests.get(url).json()
-
+        
         pages = response['query']['pages']
         for page_id in pages:
             articleid = pages[page_id]
