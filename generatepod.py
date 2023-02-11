@@ -119,13 +119,14 @@ for header, section in wikisections.items():
             continue
         url = f'{wikipedia_api_base}?action=query&prop=extracts&titles={article_normalized}&exsentences=1&explaintext=1&format=json'
         response = requests.get(url).json()
-   
-        pages = response['query']['pages']
-        for page_id in pages:
-            articleid = pages[page_id]
-            if 'extract' in articleid:
-                summary = articleid['extract']
-            else: summary = "No summary available"
+
+        summary = "No summary available"
+        if "pages" in response['query']:
+            pages = response['query']['pages']
+            for page_id in pages:
+                articleid = pages[page_id]
+                if 'extract' in articleid:
+                    summary = articleid['extract']
 
         url = f'{wikipedia_api_base}?action=query&prop=pageimages&titles={article_normalized}&format=json&pithumbsize=500'
         response = requests.get(url).json()
