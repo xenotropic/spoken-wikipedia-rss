@@ -4,7 +4,8 @@ import re, sys, requests, urllib.parse
 from datetime import datetime
 
 pagestring = "https://en.wikipedia.org/wiki/Wikipedia:Spoken_articles?action=raw"
-api_base = "https://en.wikipedia.org/w/api.php" 
+wikipedia_api_base = "https://en.wikipedia.org/w/api.php" 
+commons_api_base = "https://commons.wikimedia.org/w/api.php" 
 
 def get_web_page(url):
     page = requests.get(url)
@@ -19,18 +20,32 @@ def clean_header (string):
     string = re.sub(r"=*", "", string )
     return string
 
+def file_exists(path):
+    headers={'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'}
+    r = requests.head(path,headers=headers)
+    if r.status_code == requests.codes.ok:
+        return True
+    else:
+        return False
+
+
+    
 def wiki_parser(text):
 
 # split into headings and body text
     headings = []
     body_texts = []
+    body = ""
     lines = text.split('\n')
     for line in lines:
         if line.startswith('=='):
             headings.append(line)
+            if (len (body) > 0 ):
+                body_texts.append(body)
+                body = ""
         else:
-            body_texts.append(line)
-
+              body += line
+    body_texts.append(body)
 # create the dict
     wiki_dict = {}
     for h, b in zip(headings, body_texts):
@@ -50,16 +65,22 @@ rssheader = """<?xml version="1.0"?><rss xmlns:atom="http://www.w3.org/2005/Atom
 print (rssheader)
 
 wikitext = get_web_page ( pagestring )
-wikitext = wikitext.split('==', 1)[1] # toss the header
+wikitext = "==" + wikitext.split('==', 1)[1]  # toss the header
+
 wikisections = wiki_parser ( wikitext )
 
 section_count = 0
-for header, sectiontext in wikisections.items():
-    wikitext = clean_braces_and_comments (wikitext)
-    print ( str ( section_count) +" "+ header ,  file=sys.stderr )
+test_start = 0
+test_end = 100
+
+for header, section in wikisections.items():
+    section_count+=1
+    # clean_section_text = clean_braces_and_comments (section )
+    clean_section_text = section
+    if ( section_count < test_start ) or ( section_count > test_end ): continue
+    print ("* Processing heading: " + header , file=sys.stderr)
     if ( "=See also=" in header  ) or ( "=External links=" in header ): break
-    # if section_count > 5: continue # for testing
-    records = re.findall( r'\[\[:File:[^\]]*\]\]', wikitext)
+    records = re.findall( r'\[\[:File:[^\]]*\]\]', clean_section_text )
     heading_count = 0
     output = []
     article_count = 0
@@ -71,9 +92,12 @@ for header, sectiontext in wikisections.items():
         if (article[:5] == "(Part" ): continue # skipping the multiparts; there are few, they are mostly old, formatting is a special case 
         article_normalized = re.sub('&', '&amp;', article)
         filename = items [0][8:]
-        filename_normalized = urllib.parse.quote ( filename )
-        print("Processing: " + article + " | " + filename, file=sys.stderr)
-        url = f'{api_base}/w/api.php?action=query&titles=File:{filename_normalized}&prop=imageinfo&iiprop=timestamp|url|user|metadata|extmetadata&format=json'
+        # filename_normalized = urllib.parse.quote ( filename )
+        # filename_normalized = re.sub(r"&20", "_", filename_normalized )
+        filename_normalized = re.sub(r" ", "_", filename )
+        filename_normalized = re.sub(r"&", "%26", filename_normalized )
+        print("Processing: " + article + " | " + filename_normalized, file=sys.stderr)
+        url = f'{commons_api_base}?action=query&titles=File:{filename_normalized}&prop=imageinfo&iiprop=timestamp|url|user|metadata|extmetadata&format=json'
         response = requests.get(url).json()
         pages = response['query']['pages']
         bad_listing = True
@@ -90,10 +114,12 @@ for header, sectiontext in wikisections.items():
             human_license = "Unknown"
             if "LicenseShortName" in extmetadata:
                 human_license = extmetadata["LicenseShortName"]["value"]
-        if ( bad_listing ): continue
-        url = f'{api_base}?action=query&prop=extracts&titles={article_normalized}&exsentences=1&explaintext=1&format=json'
+        if ( bad_listing ):
+            print ("********* Error Cannot Process " + filename_normalized + " skipping" , file=sys.stderr)
+            continue
+        url = f'{wikipedia_api_base}?action=query&prop=extracts&titles={article_normalized}&exsentences=1&explaintext=1&format=json'
         response = requests.get(url).json()
-        
+   
         pages = response['query']['pages']
         for page_id in pages:
             articleid = pages[page_id]
@@ -101,14 +127,23 @@ for header, sectiontext in wikisections.items():
                 summary = articleid['extract']
             else: summary = "No summary available"
 
-        url = f'{api_base}?action=query&prop=pageimages&titles={article_normalized}&format=json&pithumbsize=500'
+        url = f'{wikipedia_api_base}?action=query&prop=pageimages&titles={article_normalized}&format=json&pithumbsize=500'
         response = requests.get(url).json()
 
         pages = response['query']['pages']
         for page_id in pages:
             articleid = pages[page_id]
             image_url = articleid.get('thumbnail', {}).get('source', '')
-            
+        sound_filename = re.findall(r'/([^/]+)$', sound_url)[0] # everything after the last slash
+        # doing the substitutions for commons and wikipedia, since most files seem to be transcoded on
+        # only one
+        sound_url = re.sub(r"org/wikipedia/commons/", "org/wikipedia/commons/transcoded/", sound_url)
+        sound_url = re.sub(r"org/wikipedia/en/", "org/wikipedia/en/transcoded/", sound_url)
+        sound_url = sound_url + "/" + sound_filename + ".mp3"
+        # some files just aren't transcoded yet
+        if not file_exists ( sound_url ):
+            print ("********* Error Missing File " + sound_url , file=sys.stderr)
+            continue
         print ( "<item><title>" + article_normalized + "</title><link>" + sound_url + "</link>" )
         print ( "<enclosure url=\"" + sound_url + "\" />")
         print ( "<guid>" + sound_url + "</guid>" )
