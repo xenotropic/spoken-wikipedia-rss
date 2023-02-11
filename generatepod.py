@@ -27,22 +27,22 @@ def file_exists(path):
         return True
     else:
         return False
-
-
-    
+ 
 def wiki_parser(text):
 
 # split into headings and body text
     headings = []
     body_texts = []
     body = ""
+    first = True
     lines = text.split('\n')
     for line in lines:
         if line.startswith('=='):
             headings.append(line)
-            if (len (body) > 0 ):
+            if ( not first ):
                 body_texts.append(body)
                 body = ""
+            first = False
         else:
               body += line
     body_texts.append(body)
