@@ -3,6 +3,9 @@
 import re, sys, requests, urllib.parse
 from datetime import datetime
 
+pagestring = "https://en.wikipedia.org/wiki/Wikipedia:Spoken_articles?action=raw"
+api_base = "https://en.wikipedia.org/w/api.php" 
+
 def get_web_page(url):
     page = requests.get(url)
     return page.text
@@ -46,8 +49,7 @@ rssheader = """<?xml version="1.0"?><rss xmlns:atom="http://www.w3.org/2005/Atom
 
 print (rssheader)
 
-basestring = "https://en.wikipedia.org/wiki/Wikipedia:Spoken_articles?action=raw"
-wikitext = get_web_page ( basestring )
+wikitext = get_web_page ( pagestring )
 wikitext = wikitext.split('==', 1)[1] # toss the header
 wikisections = wiki_parser ( wikitext )
 
@@ -71,7 +73,7 @@ for header, sectiontext in wikisections.items():
         filename = items [0][8:]
         filename_normalized = urllib.parse.quote ( filename )
         print("Processing: " + article + " | " + filename, file=sys.stderr)
-        url = f'https://en.wikipedia.org/w/api.php?action=query&titles=File:{filename_normalized}&prop=imageinfo&iiprop=timestamp|url|user|metadata|extmetadata&format=json'
+        url = f'{api_base}/w/api.php?action=query&titles=File:{filename_normalized}&prop=imageinfo&iiprop=timestamp|url|user|metadata|extmetadata&format=json'
         response = requests.get(url).json()
         pages = response['query']['pages']
         bad_listing = True
@@ -89,7 +91,7 @@ for header, sectiontext in wikisections.items():
             if "LicenseShortName" in extmetadata:
                 human_license = extmetadata["LicenseShortName"]["value"]
         if ( bad_listing ): continue
-        url = f'https://en.wikipedia.org/w/api.php?action=query&prop=extracts&titles={article_normalized}&exsentences=1&explaintext=1&format=json'
+        url = f'{api_base}?action=query&prop=extracts&titles={article_normalized}&exsentences=1&explaintext=1&format=json'
         response = requests.get(url).json()
         
         pages = response['query']['pages']
@@ -99,14 +101,14 @@ for header, sectiontext in wikisections.items():
                 summary = articleid['extract']
             else: summary = "No summary available"
 
-        url = f'https://en.wikipedia.org/w/api.php?action=query&prop=pageimages&titles={article_normalized}&format=json&pithumbsize=500'
+        url = f'{api_base}?action=query&prop=pageimages&titles={article_normalized}&format=json&pithumbsize=500'
         response = requests.get(url).json()
 
         pages = response['query']['pages']
         for page_id in pages:
             articleid = pages[page_id]
             image_url = articleid.get('thumbnail', {}).get('source', '')
-
+            
         print ( "<item><title>" + article_normalized + "</title><link>" + sound_url + "</link>" )
         print ( "<enclosure url=\"" + sound_url + "\" />")
         print ( "<guid>" + sound_url + "</guid>" )
