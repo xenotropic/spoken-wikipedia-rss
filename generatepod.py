@@ -6,6 +6,19 @@ from datetime import datetime
 pagestring = "https://en.wikipedia.org/wiki/Wikipedia:Spoken_articles?action=raw"
 wikipedia_api_base = "https://en.wikipedia.org/w/api.php" 
 commons_api_base = "https://commons.wikimedia.org/w/api.php" 
+owner_email = "joe@morris.cloud"
+owner_name = "Joseph Morris"
+feed_url = "https://wcast.me/"
+feed_image = "cover.jpg"
+feed_title = "Spoken Wikipedia"
+feed_description = f"""These are Wikipedia articles as read by volunteers. It is generated as an RSS feed from the files in the Spoken Wikipedia project. The shownotes list the categories and authors, so you can search on, for example "Philosophy" to see articles in that category, or "thrownfootfalls" to see all recordings by that user. This feed is in beta and has not been tested on many devices.  The best way to provide feedback is by opening an issue at https://github.com/xenotropic/spoken-wikipedia-rss (that's also where the source code is to generate this RSS feed). Alternatively you can email me at joe@morris.cloud"""
+
+def open_text_file(filename):
+    try:
+        with open(filename, 'r') as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
 
 def get_web_page(url):
     page = requests.get(url)
@@ -20,7 +33,7 @@ def clean_header (string):
     string = re.sub(r"=*", "", string )
     return string
 
-def file_exists(path):
+def file_exists(path): 
     headers={'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'}
     r = requests.head(path,headers=headers)
     if r.status_code == requests.codes.ok:
@@ -54,24 +67,36 @@ def wiki_parser(text):
 # return the dict
     return wiki_dict
 
-rssheader = """<?xml version="1.0"?><rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0">
+rssheader = f"""<?xml version="1.0"?><rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0">
 <channel>
-<title>Spoken Wikipedia</title>
-<link>https://morris.cloud/spoken-wikipedia/</link>
-<description>These are Wikipedia articles as read by volunteers. It is generated as an RSS feed from the files in the Spoken Wikipedia project. The shownotes list the categories and authors, so you can search on, for example "Philosophy" to see articles in that category, or "thrownfootfalls" to see all recordings by that user. This feed uses the files hosted on Wikipedia, which are usually in ogg format, or in some rare cases wav. These ogg files typically do not work on Apple devices, certainly not iTunes. If you get it working on an iOS devices let me know. On Android, this feed is tested and working with Antennapod, should work with most other podcast apps (since Android includes ogg support at a system level). The best way to provide feedback is by opening an issue at https://github.com/xenotropic/spoken-wikipedia-rss (that's also where the source code is to generate this RSS feed). Alternatively you can email me at joe@morris.cloud </description>
-<itunes:image href="https://morris.cloud/spokenwikipedia/cover.png"/>
+<title>{feed_title}</title>
+<link>{feed_url}</link>
+<language>en</language>
+<itunes:category>Education</itunes:category>
+<description>{feed_description} </description>
+<itunes:image href="{feed_image}"/>
+       <itunes:owner>
+          <itunes:name>{owner_name}</itunes:name>
+        <itunes:email>{owner_email}</itunes:email>
+        </itunes:owner>
  """   
 
 print (rssheader)
 
 wikitext = get_web_page ( pagestring )
-wikitext = "==" + wikitext.split('==', 1)[1]  # toss the header
+wikitext = "==" + wikitext.split('==', 1)[1]  # toss the intro text
 
 wikisections = wiki_parser ( wikitext )
 
 section_count = 0
 test_start = 0
 test_end = 100
+
+apikey = open_text_file ("./apikey.txt")
+# useragent = 'Spoken Wikipedia Podcast RSS Generator ( https://wcast.me/ )'
+useragent = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'
+
+if ( len ( apikey) > 0 ): apikey = "Bearer " + apikey
 
 for header, section in wikisections.items():
     section_count+=1
@@ -98,7 +123,10 @@ for header, section in wikisections.items():
         filename_normalized = re.sub(r"&", "%26", filename_normalized )
         print("Processing: " + article + " | " + filename_normalized, file=sys.stderr)
         url = f'{commons_api_base}?action=query&titles=File:{filename_normalized}&prop=imageinfo&iiprop=timestamp|url|user|metadata|extmetadata&format=json'
-        response = requests.get(url).json()
+        headers=""
+        if ( len ( apikey ) > 0  ):
+            headers={'User-Agent': useragent , 'Authorization': apikey }
+        response = requests.get(url, headers=headers).json()
         pages = response['query']['pages']
         bad_listing = True
         for page_id in pages:
@@ -118,7 +146,7 @@ for header, section in wikisections.items():
             print ("********* Error Cannot Process " + filename_normalized + " skipping" , file=sys.stderr)
             continue
         url = f'{wikipedia_api_base}?action=query&prop=extracts&titles={article_normalized}&exsentences=1&explaintext=1&format=json'
-        response = requests.get(url).json()
+        response = requests.get(url, headers=headers).json()
 
         summary = "No summary available"
         if "pages" in response['query']:
@@ -129,7 +157,7 @@ for header, section in wikisections.items():
                     summary = articleid['extract']
 
         url = f'{wikipedia_api_base}?action=query&prop=pageimages&titles={article_normalized}&format=json&pithumbsize=500'
-        response = requests.get(url).json()
+        response = requests.get(url, headers=headers).json()
 
         pages = response['query']['pages']
         for page_id in pages:
