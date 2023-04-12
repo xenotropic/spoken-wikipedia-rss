@@ -34,7 +34,7 @@ def clean_header (string):
     return string
 
 def file_exists(path): 
-    headers={'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'}
+    headers={'User-Agent': 'Spoken-wikipedia-rss-bot (https://github.com/xenotropic/spoken-wikipedia-rss/; joe@morris.cloud)'}
     r = requests.head(path,headers=headers)
     if r.status_code == requests.codes.ok:
         return True
