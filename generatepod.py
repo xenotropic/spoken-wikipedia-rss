@@ -93,8 +93,7 @@ test_start = 0
 test_end = 100
 
 apikey = open_text_file ("./apikey.txt")
-# useragent = 'Spoken Wikipedia Podcast RSS Generator ( https://wcast.me/ )'
-useragent = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'
+useragent = 'Spoken-wikipedia-rss-bot (https://github.com/xenotropic/spoken-wikipedia-rss/; joe@morris.cloud)'
 
 if ( len ( apikey) > 0 ): apikey = "Bearer " + apikey
 
