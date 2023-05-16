@@ -141,6 +141,23 @@ for header, section in wikisections.items():
             human_license = "Unknown"
             if "LicenseShortName" in extmetadata:
                 human_license = extmetadata["LicenseShortName"]["value"]
+            extauthor = ""
+            if ('Artist' in extmetadata):
+                if ('value' in extmetadata['Artist']):
+                    extauthor = extmetadata['Artist']['value']
+            if len (extauthor) > 0:
+                extauthor = re.sub('<[^<]+?>', '', extauthor)
+                extauthor = extauthor.replace ( "Speaker: ", "") 
+                extauthor = extauthor.replace ( "User: ", "") 
+                extauthor = extauthor.replace ( "\nAuthors of the article", "") 
+                author = extauthor
+            orig_date = ""
+            if ('DateTimeOriginal' in extmetadata):
+                if ('value' in extmetadata['DateTimeOriginal']):
+                    orig_date = extmetadata['DateTimeOriginal']['value']
+                    orig_date = re.sub('<[^<]+?>', '', orig_date)
+            if len (orig_date) > 0: filedate = orig_date
+        
         if ( bad_listing ):
             print ("********* Error Cannot Process " + filename_normalized + " skipping" , file=sys.stderr)
             continue
