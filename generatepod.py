@@ -2,6 +2,7 @@
 
 import re, sys, requests, urllib.parse
 from datetime import datetime
+from dateutil.parser import parse
 
 pagestring = "https://en.wikipedia.org/wiki/Wikipedia:Spoken_articles?action=raw"
 wikipedia_api_base = "https://en.wikipedia.org/w/api.php" 
@@ -40,7 +41,21 @@ def file_exists(path):
         return True
     else:
         return False
- 
+
+def is_date(string, fuzzy=False):
+    """
+    Return whether the string can be interpreted as a date.
+
+    :param string: str, string to check for date
+    :param fuzzy: bool, ignore unknown tokens in string if True
+    """
+    try: 
+        parse(string, fuzzy=fuzzy)
+        return True
+
+    except ValueError:
+        return False
+    
 def wiki_parser(text):
 
 # split into headings and body text
@@ -156,8 +171,17 @@ for header, section in wikisections.items():
                 if ('value' in extmetadata['DateTimeOriginal']):
                     orig_date = extmetadata['DateTimeOriginal']['value']
                     orig_date = re.sub('<[^<]+?>', '', orig_date)
-            if len (orig_date) > 0: filedate = orig_date
-        
+                    if not is_date ( orig_date ):
+                        end_year_pos = re.search(r'\d{4}', orig_date)
+                        if end_year_pos:                                  # Some of these metadata have comments at the end
+                            index = end_year_pos.end()
+                            orig_date = orig_date[:index]                        
+                if is_date (orig_date): filedate = orig_date
+        if ( is_date (filedate) ):
+            dt = parse ( filedate )
+            filedate = dt.strftime ("%a, %d %b %Y %H:%M:%S %z")
+        else:
+            filedate = "Wed, 02 Oct 2002 08:00:00 EST" #don't want these unknowns / problems cluttering new end of the feed
         if ( bad_listing ):
             print ("********* Error Cannot Process " + filename_normalized + " skipping" , file=sys.stderr)
             continue
