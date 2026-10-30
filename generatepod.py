@@ -23,9 +23,8 @@ FEED_DESCRIPTION = "These are Wikipedia articles as read by volunteers. It is ge
 FEED_IMAGE = "https://sw.toolforge.org/cover.jpg"
 FEED_OWNER_NAME = "Joseph Morris"
 FEED_OWNER_EMAIL = "joe@morris.cloud"
-FEED_EXPLICIT = "false"
 
-USER_AGENT = "SpokenWikipediaPodcaster/1.5 (https://github.com/xenotropic/spoken-wikipedia-rss; joe@morris.cloud)"
+USER_AGENT = "SpokenWikipediaPodcaster/2.0 (https://github.com/xenotropic/spoken-wikipedia-rss; joe@morris.cloud)"
 DB_HOST = "enwiki.analytics.db.svc.wikimedia.cloud"
 DB_NAME = "enwiki_p"
 MIN_FILE_SIZE_BYTES = 1500000
@@ -74,15 +73,40 @@ def fetch_index_whitelist(session):
         "prop": "wikitext",
         "format": "json"
     }
+    all_whitelist = set()
+    explicit_whitelist = set()
     try:
         res = session.get(url, params=params, headers={"User-Agent": USER_AGENT}, timeout=15)
         if res.status_code == 200:
             wikitext = res.json().get("parse", {}).get("wikitext", {}).get("*", "")
-            matches = re.findall(r'\[\[:?(?:File|Image|Media):([^|\]]+\.(?:ogg|oga|mp3|flac|wav|opus))', wikitext, re.IGNORECASE)
-            return set(m.strip().replace(' ', '_') for m in matches)
+            
+            is_explicit_section = False
+            for line in wikitext.split('\n'):
+                header_match = re.match(r'^={1,6}\s*(.*?)\s*={1,6}', line)
+                if header_match:
+                    header_title = header_match.group(1).lower()
+                    is_explicit_section = ('human sexuality' in header_title)
+                    
+                matches = re.findall(r'\[\[:?(?:File|Image|Media):([^|\]]+\.(?:ogg|oga|mp3|flac|wav|opus))', line, re.IGNORECASE)
+                for m in matches:
+                    fname = m.strip().replace(' ', '_')
+                    all_whitelist.add(fname)
+                    if is_explicit_section:
+                        explicit_whitelist.add(fname)
+                        
     except Exception as e:
         print(f"Error fetching index whitelist: {e}", file=sys.stderr)
-    return set()
+    return all_whitelist, explicit_whitelist
+
+def load_explicit_list(filepath):
+    explicit_titles = set()
+    if os.path.exists(filepath):
+        with open(filepath, 'r', encoding='utf-8') as f:
+            for line in f:
+                clean_line = line.strip()
+                if clean_line and not clean_line.startswith('#'):
+                    explicit_titles.add(clean_line.replace(' ', '_'))
+    return explicit_titles
 
 def batch_fetch_file_metadata(filenames, session):
     metadata_map = {}
@@ -268,33 +292,14 @@ def resolve_verified_mp3(file_info):
         
     return None
 
-def generate_rss_feed(output_path, limit):
-    print(f"Querying MariaDB replica for spoken articles (Limit: {limit})...")
-    raw_records = fetch_spoken_records(limit)
-    print(f"Retrieved {len(raw_records)} media transclusions from database.")
-
-    session = requests.Session()
-    
-    print("Fetching whitelist from Wikipedia:Spoken_articles...")
-    whitelist_set = fetch_index_whitelist(session)
-    print(f"Loaded {len(whitelist_set)} approved filenames from index page.")
-
-    unique_files = list(set([f for _, f in raw_records]))
-    print(f"Batch fetching file metadata for {len(unique_files)} files...")
-    metadata_map = batch_fetch_file_metadata(unique_files, session)
-    
-    print("Filtering and deduplicating records...")
-    filtered_records = filter_and_deduplicate(raw_records, metadata_map, whitelist_set)
-    
-    unique_articles = list(set([r[0] for r in filtered_records]))
-    print(f"Batch fetching page images for {len(unique_articles)} articles...")
-    image_map = batch_fetch_article_images(unique_articles, session)
-
+def write_feed(items, output_path, is_explicit_feed, image_map):
     xml_items = []
     skipped_count = 0
+    
+    explicit_flag = "yes" if is_explicit_feed else "false"
+    feed_title = f"{FEED_TITLE} (Explicit)" if is_explicit_feed else FEED_TITLE
 
-    print("Verifying audio transcode availability and building feed items...")
-    for article, audio_file, file_info in filtered_records:
+    for article, audio_file, file_info in items:
         mp3_url = resolve_verified_mp3(file_info)
         if not mp3_url:
             skipped_count += 1
@@ -329,11 +334,11 @@ def generate_rss_feed(output_path, limit):
     feed_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0">
   <channel>
-    <title>{escape(FEED_TITLE)}</title>
+    <title>{escape(feed_title)}</title>
     <link>{escape(FEED_LINK)}</link>
     <language>{escape(FEED_LANGUAGE)}</language>
     <itunes:category text="{escape(FEED_CATEGORY)}" />
-    <itunes:explicit>{escape(FEED_EXPLICIT)}</itunes:explicit>
+    <itunes:explicit>{explicit_flag}</itunes:explicit>
     <description>{escape(FEED_DESCRIPTION)}</description>
     <itunes:image href="{escape(FEED_IMAGE)}" />
     <itunes:owner>
@@ -350,15 +355,66 @@ def generate_rss_feed(output_path, limit):
         temp_name = tf.name
     os.replace(temp_name, output_path)
     os.chmod(output_path, 0o644)
-    print(f"Feed generation complete: {len(xml_items)} items written to {output_path} ({skipped_count} skipped).")
+    print(f"[{'Explicit' if is_explicit_feed else 'Clean'}] Feed generation complete: {len(xml_items)} items written to {output_path} ({skipped_count} skipped).")
+
+def generate_rss_feeds(out_clean, out_explicit, explicit_list_path, limit):
+    print(f"Querying MariaDB replica for spoken articles (Limit: {limit})...")
+    raw_records = fetch_spoken_records(limit)
+    print(f"Retrieved {len(raw_records)} media transclusions from database.")
+
+    session = requests.Session()
+    
+    print("Fetching whitelist from Wikipedia:Spoken_articles...")
+    all_whitelist, explicit_whitelist = fetch_index_whitelist(session)
+    print(f"Loaded {len(all_whitelist)} approved filenames ({len(explicit_whitelist)} explicitly flagged via section headers).")
+
+    explicit_titles_set = load_explicit_list(explicit_list_path)
+    if explicit_titles_set:
+        print(f"Loaded {len(explicit_titles_set)} custom explicit titles from {explicit_list_path}.")
+
+    unique_files = list(set([f for _, f in raw_records]))
+    print(f"Batch fetching file metadata for {len(unique_files)} files...")
+    metadata_map = batch_fetch_file_metadata(unique_files, session)
+    
+    print("Filtering and deduplicating records...")
+    filtered_records = filter_and_deduplicate(raw_records, metadata_map, all_whitelist)
+    
+    unique_articles = list(set([r[0] for r in filtered_records]))
+    print(f"Batch fetching page images for {len(unique_articles)} articles...")
+    image_map = batch_fetch_article_images(unique_articles, session)
+
+    clean_items = []
+    explicit_items = []
+    
+    # Regex to catch explicit words anywhere in the article title
+    profanity_pattern = re.compile(r'(?i)\b(bitch|shit|fuck|piss)')
+
+    for article, audio_file, file_info in filtered_records:
+        is_explicit = False
+        
+        if audio_file in explicit_whitelist:
+            is_explicit = True
+        elif article.replace(' ', '_') in explicit_titles_set:
+            is_explicit = True
+        elif profanity_pattern.search(article):
+            is_explicit = True
+            
+        explicit_items.append((article, audio_file, file_info))
+        if not is_explicit:
+            clean_items.append((article, audio_file, file_info))
+
+    write_feed(clean_items, out_clean, False, image_map)
+    write_feed(explicit_items, out_explicit, True, image_map)
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate Spoken Wikipedia RSS Feed")
+    parser = argparse.ArgumentParser(description="Generate Spoken Wikipedia RSS Feeds")
     parser.add_argument("--limit", type=int, default=0, help="Limit number of articles processed")
-    parser.add_argument("--out", type=str, default="/data/project/sw/public_html/sw.rss", help="Output path")
+    parser.add_argument("--out-clean", type=str, default="/data/project/sw/public_html/sw.rss", help="Output path for the clean feed")
+    parser.add_argument("--out-explicit", type=str, default="/data/project/sw/public_html/sw-explicit.rss", help="Output path for the explicit feed")
+    parser.add_argument("--explicit-list", type=str, default="/data/project/sw/spoken-wikipedia-rss/explicit-only.txt", help="Path to text file containing article titles to exclude from clean feed")
     args = parser.parse_args()
-    generate_rss_feed(args.out, args.limit)
+    
+    generate_rss_feeds(args.out_clean, args.out_explicit, args.explicit_list, args.limit)
 
 if __name__ == "__main__":
     main()
-    
