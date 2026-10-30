@@ -25,7 +25,7 @@ FEED_OWNER_NAME = "Joseph Morris"
 FEED_OWNER_EMAIL = "joe@morris.cloud"
 FEED_EXPLICIT = "false"
 
-USER_AGENT = "SpokenWikipediaPodcaster/1.4 (https://github.com/xenotropic/spoken-wikipedia-rss; joe@morris.cloud)"
+USER_AGENT = "SpokenWikipediaPodcaster/1.5 (https://github.com/xenotropic/spoken-wikipedia-rss; joe@morris.cloud)"
 DB_HOST = "enwiki.analytics.db.svc.wikimedia.cloud"
 DB_NAME = "enwiki_p"
 MIN_FILE_SIZE_BYTES = 1500000
@@ -111,7 +111,7 @@ def batch_fetch_file_metadata(filenames, session):
                         info = media_info[0]
                         mp3_url = None
                         for deriv in info.get("derivatives", []):
-                            src = deriv.get("src", "")
+                            src = deriv.get("src", "").split("?")[0]
                             if src.lower().endswith(".mp3") or deriv.get("type") == "audio/mpeg":
                                 mp3_url = src
                                 break
@@ -255,14 +255,17 @@ def resolve_verified_mp3(file_info):
     if not file_info:
         return None
     if file_info.get("transcoded_mp3"):
-        return file_info["transcoded_mp3"]
-    raw_url = file_info.get("url", "")
+        return file_info["transcoded_mp3"].split("?")[0]
+        
+    raw_url = file_info.get("url", "").split("?")[0]
     if raw_url.lower().endswith(".mp3"):
         return raw_url
+        
     if "upload.wikimedia.org" in raw_url:
         filename = raw_url.split("/")[-1]
         transcoded_url = raw_url.replace("/commons/", "/commons/transcoded/").replace("/en/", "/en/transcoded/")
         return f"{transcoded_url}/{filename}.mp3"
+        
     return None
 
 def generate_rss_feed(output_path, limit):
@@ -358,3 +361,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
