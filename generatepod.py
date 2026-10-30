@@ -25,7 +25,7 @@ FEED_OWNER_NAME = "Joseph Morris"
 FEED_OWNER_EMAIL = "joe@morris.cloud"
 FEED_EXPLICIT = "false"
 
-USER_AGENT = "SpokenWikipediaPodcaster/1.3 (https://github.com/xenotropic/spoken-wikipedia-rss; joe@morris.cloud)"
+USER_AGENT = "SpokenWikipediaPodcaster/1.4 (https://github.com/xenotropic/spoken-wikipedia-rss; joe@morris.cloud)"
 DB_HOST = "enwiki.analytics.db.svc.wikimedia.cloud"
 DB_NAME = "enwiki_p"
 MIN_FILE_SIZE_BYTES = 1500000
@@ -53,12 +53,6 @@ def fetch_spoken_records(limit=0):
     JOIN linktarget lt_img ON il.il_target_id = lt_img.lt_id
     WHERE lt_cat.lt_title = 'Spoken_articles'
       AND p.page_namespace = 0
-      AND (
-          lt_img.lt_title LIKE '%.ogg' 
-          OR lt_img.lt_title LIKE '%.oga' 
-          OR lt_img.lt_title LIKE '%.mp3' 
-          OR lt_img.lt_title LIKE '%.flac'
-      )
     {limit_clause};
     """
     conn = get_db_connection()
@@ -68,7 +62,9 @@ def fetch_spoken_records(limit=0):
             rows = cur.fetchall()
     finally:
         conn.close()
-    return [(r["article_title"], r["audio_file"]) for r in rows]
+        
+    allowed_exts = ('.ogg', '.oga', '.mp3', '.flac', '.wav', '.opus')
+    return [(r["article_title"], r["audio_file"]) for r in rows if r["audio_file"].lower().endswith(allowed_exts)]
 
 def fetch_index_whitelist(session):
     url = "https://en.wikipedia.org/w/api.php"
@@ -88,13 +84,13 @@ def fetch_index_whitelist(session):
         print(f"Error fetching index whitelist: {e}", file=sys.stderr)
     return set()
 
-def batch_fetch_commons_metadata(filenames, session):
+def batch_fetch_file_metadata(filenames, session):
     metadata_map = {}
     chunk_size = 50
     for i in range(0, len(filenames), chunk_size):
         chunk = filenames[i:i + chunk_size]
         titles = "|".join([f"File:{f.replace(' ', '_')}" for f in chunk])
-        url = "https://commons.wikimedia.org/w/api.php"
+        url = "https://en.wikipedia.org/w/api.php"
         payload = {
             "action": "query",
             "titles": titles,
@@ -123,6 +119,32 @@ def batch_fetch_commons_metadata(filenames, session):
         except requests.RequestException as e:
             print(f"Error fetching metadata chunk: {e}", file=sys.stderr)
     return metadata_map
+
+def batch_fetch_article_images(articles, session):
+    image_map = {}
+    chunk_size = 50
+    for i in range(0, len(articles), chunk_size):
+        chunk = articles[i:i + chunk_size]
+        titles = "|".join([a.replace('_', ' ') for a in chunk])
+        url = "https://en.wikipedia.org/w/api.php"
+        payload = {
+            "action": "query",
+            "titles": titles,
+            "prop": "pageimages",
+            "pithumbsize": "500",
+            "format": "json",
+            "formatversion": "2"
+        }
+        try:
+            res = session.post(url, data=payload, headers={"User-Agent": USER_AGENT}, timeout=20)
+            if res.status_code == 200:
+                pages = res.json().get("query", {}).get("pages", [])
+                for p in pages:
+                    if "thumbnail" in p:
+                        image_map[p["title"]] = p["thumbnail"].get("source")
+        except requests.RequestException as e:
+            print(f"Error fetching article images chunk: {e}", file=sys.stderr)
+    return image_map
 
 def filter_and_deduplicate(raw_records, metadata_map, whitelist_set):
     grouped = {}
@@ -254,11 +276,15 @@ def generate_rss_feed(output_path, limit):
     print(f"Loaded {len(whitelist_set)} approved filenames from index page.")
 
     unique_files = list(set([f for _, f in raw_records]))
-    print(f"Batch fetching Commons metadata for {len(unique_files)} files...")
-    metadata_map = batch_fetch_commons_metadata(unique_files, session)
+    print(f"Batch fetching file metadata for {len(unique_files)} files...")
+    metadata_map = batch_fetch_file_metadata(unique_files, session)
     
     print("Filtering and deduplicating records...")
     filtered_records = filter_and_deduplicate(raw_records, metadata_map, whitelist_set)
+    
+    unique_articles = list(set([r[0] for r in filtered_records]))
+    print(f"Batch fetching page images for {len(unique_articles)} articles...")
+    image_map = batch_fetch_article_images(unique_articles, session)
 
     xml_items = []
     skipped_count = 0
@@ -277,6 +303,9 @@ def generate_rss_feed(output_path, limit):
         article_url_xml = escape(f"https://en.wikipedia.org/wiki/{urllib.parse.quote(article)}")
         mp3_url_xml = escape(mp3_url)
         
+        image_url = image_map.get(article.replace("_", " "))
+        image_tag = f'\n      <itunes:image href="{escape(image_url)}" />' if image_url else ""
+        
         desc = (f"<![CDATA[<p>This is a spoken word version of the Wikipedia article "
                 f"\"{clean_article}\" recorded on {human_date}.</p>"
                 f"<p>Read by: {author}<br />License: {license_name}</p>]]>")
@@ -288,7 +317,7 @@ def generate_rss_feed(output_path, limit):
       <pubDate>{pub_date}</pubDate>
       <enclosure url="{mp3_url_xml}" type="audio/mpeg" />
       <description>{desc}</description>
-      <itunes:author>{author}</itunes:author>
+      <itunes:author>{author}</itunes:author>{image_tag}
     </item>"""
         xml_items.append(item_xml)
 
