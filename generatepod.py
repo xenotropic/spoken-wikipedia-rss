@@ -296,7 +296,7 @@ def write_feed(items, output_path, is_explicit_feed, image_map):
     xml_items = []
     skipped_count = 0
     
-    explicit_flag = "yes" if is_explicit_feed else "false"
+    explicit_flag = "true" if is_explicit_feed else "false"
     feed_title = f"{FEED_TITLE} (Explicit)" if is_explicit_feed else FEED_TITLE
 
     for article, audio_file, file_info in items:
