@@ -96,7 +96,7 @@ def batch_fetch_file_metadata(filenames, session):
             "titles": titles,
             "prop": "imageinfo|videoinfo",
             "iiprop": "timestamp|user|url|size|extmetadata",
-            "viprop": "derivatives",
+            "viprop": "timestamp|user|url|size|extmetadata|derivatives",
             "format": "json",
             "formatversion": "2"
         }
@@ -106,10 +106,11 @@ def batch_fetch_file_metadata(filenames, session):
                 pages = res.json().get("query", {}).get("pages", [])
                 for p in pages:
                     fname = p.get("title", "").replace("File:", "").replace(" ", "_")
-                    if p.get("imageinfo"):
-                        info = p["imageinfo"][0]
+                    media_info = p.get("videoinfo") or p.get("imageinfo")
+                    if media_info:
+                        info = media_info[0]
                         mp3_url = None
-                        for deriv in p.get("videoinfo", [{}])[0].get("derivatives", []):
+                        for deriv in info.get("derivatives", []):
                             src = deriv.get("src", "")
                             if src.lower().endswith(".mp3") or deriv.get("type") == "audio/mpeg":
                                 mp3_url = src
