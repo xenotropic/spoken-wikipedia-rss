@@ -1,79 +1,47 @@
-#!/usr/bin/env python3
-"""
-Spoken Wikipedia RSS Feed Generator
-Queries the Toolforge enwiki_p replica for spoken articles, batches metadata
-lookups via the MediaWiki Action API, verifies transcoded MP3 streams, and
-generates a validated podcast RSS XML document.
-"""
-
-import argparse
-import configparser
-import html
 import os
-import pathlib
-import re
 import sys
 import tempfile
 import urllib.parse
-from datetime import datetime
-from dateutil.parser import parse
-import requests
+import re
+import argparse
+from datetime import datetime, timezone
 import pymysql
-import pymysql.cursors
+import requests
+from dateutil.parser import parse
+from xml.sax.saxutils import escape
+from email.utils import format_datetime
 
-# ---------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------
-MAX_ARTICLES = 5  # Set to 0 to process all available articles
-DEFAULT_OUTPUT_PATH = "/data/project/sw/public_html/sw.rss"
-USER_AGENT = "Spoken-wikipedia-rss-bot (https://github.com/xenotropic/spoken-wikipedia-rss/; joe@morris.cloud)"
+# ==========================================
+# USER CONFIGURATION
+# ==========================================
 
-FEED_CONFIG = {
-    "title": "Spoken Wikipedia",
-    "url": "https://wcast.me/sw/",
-    "cover_image": "https://wcast.me/sw/cover.jpg",
-    "description": (
-        "These are Wikipedia articles as read by volunteers. It is generated as an "
-        "RSS feed from the files in the Spoken Wikipedia project. The shownotes list "
-        "the authors and licenses. Source code and issue tracking are available at "
-        "https://github.com/xenotropic/spoken-wikipedia-rss."
-    ),
-    "owner_name": "Joseph Morris",
-    "owner_email": "joe@morris.cloud",
-    "language": "en-us",
-    "category": "Education",
-}
+FEED_TITLE = "Spoken Wikipedia"
+FEED_LINK = "https://sw.toolforge.org/"
+FEED_LANGUAGE = "en-us"
+FEED_CATEGORY = "Education"
+FEED_DESCRIPTION = "These are Wikipedia articles as read by volunteers. It is generated as an RSS feed from the files in the Spoken Wikipedia project. Source code and issue tracking are available at https://github.com/xenotropic/spoken-wikipedia-rss."
+FEED_IMAGE = "https://sw.toolforge.org/cover.jpg"
+FEED_OWNER_NAME = "Joseph Morris"
+FEED_OWNER_EMAIL = "joe@morris.cloud"
+FEED_EXPLICIT = "false"
 
+USER_AGENT = "SpokenWikipediaPodcaster/1.1 (https://github.com/xenotropic/spoken-wikipedia-rss; joe@morris.cloud)"
+DB_HOST = "enwiki.analytics.db.svc.wikimedia.cloud"
+DB_NAME = "enwiki_p"
+MIN_FILE_SIZE_BYTES = 1500000
+
+# ==========================================
 
 def get_db_connection():
-    """Establish connection to enwiki replica via toolforge helper or replica.my.cnf."""
-    try:
-        import toolforge
-        return toolforge.connect("enwiki_p", cursorclass=pymysql.cursors.DictCursor)
-    except Exception:
-        cnf_path = pathlib.Path.home() / "replica.my.cnf"
-        if not cnf_path.exists():
-            cnf_path = pathlib.Path.home() / ".my.cnf"
-        if not cnf_path.exists():
-            raise FileNotFoundError(f"Replica credentials not found at {cnf_path}")
-        
-        config = configparser.ConfigParser()
-        config.read(str(cnf_path))
-        user = config.get("client", "user").strip("'\"")
-        password = config.get("client", "password").strip("'\"")
-        
-        return pymysql.connect(
-            host="enwiki.analytics.db.svc.wikimedia.cloud",
-            database="enwiki_p",
-            user=user,
-            password=password,
-            charset="utf8mb4",
-            cursorclass=pymysql.cursors.DictCursor,
-        )
+    return pymysql.connect(
+        host=DB_HOST,
+        database=DB_NAME,
+        read_default_file=os.path.expanduser("~/replica.my.cnf"),
+        cursorclass=pymysql.cursors.DictCursor
+    )
 
 def fetch_spoken_records(limit=0):
     limit_clause = f"LIMIT {int(limit)}" if limit and limit > 0 else ""
-    
     sql = f"""
     SELECT 
         CONVERT(p.page_title USING utf8mb4) AS article_title,
@@ -100,54 +68,32 @@ def fetch_spoken_records(limit=0):
             rows = cur.fetchall()
     finally:
         conn.close()
-
     return [(r["article_title"], r["audio_file"]) for r in rows]
 
-
-def format_episode_title(article_title, audio_filename):
-    """Format clean episode title and detect multi-part recording indicators."""
-    clean_title = article_title.replace("_", " ")
-    match = re.search(
-        r"[-_\s(](part|pt|section)[-_\s]*([0-9]+|[a-z])", 
-        audio_filename, 
-        re.IGNORECASE
-    )
-    if match:
-        kind = "Part" if match.group(1).lower() in ("part", "pt") else "Section"
-        num = match.group(2).upper()
-        indicator = f"({kind} {num})"
-        if indicator.lower() not in clean_title.lower():
-            return f"{clean_title} {indicator}"
-    return clean_title
-
 def batch_fetch_commons_metadata(filenames, session):
-    """
-    Batch-fetch metadata and transcoded derivatives from Wikimedia Commons
-    using videoinfo (TimedMediaHandler) and imageinfo in chunks of 50.
-    """
     metadata_map = {}
     chunk_size = 50
-
     for i in range(0, len(filenames), chunk_size):
         chunk = filenames[i:i + chunk_size]
         titles = "|".join([f"File:{f.replace(' ', '_')}" for f in chunk])
-        url = (
-            "https://commons.wikimedia.org/w/api.php"
-            f"?action=query&titles={urllib.parse.quote(titles)}"
-            "&prop=imageinfo|videoinfo"
-            "&iiprop=timestamp|user|url|extmetadata"
-            "&viprop=derivatives"
-            "&format=json&formatversion=2"
-        )
+        url = "https://commons.wikimedia.org/w/api.php"
+        payload = {
+            "action": "query",
+            "titles": titles,
+            "prop": "imageinfo|videoinfo",
+            "iiprop": "timestamp|user|url|size|extmetadata",
+            "viprop": "derivatives",
+            "format": "json",
+            "formatversion": "2"
+        }
         try:
-            res = session.get(url, headers={"User-Agent": USER_AGENT}, timeout=20)
+            res = session.post(url, data=payload, headers={"User-Agent": USER_AGENT}, timeout=20)
             if res.status_code == 200:
                 pages = res.json().get("query", {}).get("pages", [])
                 for p in pages:
                     fname = p.get("title", "").replace("File:", "").replace(" ", "_")
                     if p.get("imageinfo"):
                         info = p["imageinfo"][0]
-                        # Extract authoritative MP3 derivative if present
                         mp3_url = None
                         for deriv in p.get("videoinfo", [{}])[0].get("derivatives", []):
                             src = deriv.get("src", "")
@@ -157,80 +103,64 @@ def batch_fetch_commons_metadata(filenames, session):
                         info["transcoded_mp3"] = mp3_url
                         metadata_map[fname] = info
         except requests.RequestException as e:
-            print(f"Error fetching Commons metadata batch: {e}", file=sys.stderr)
-
+            print(f"Error fetching metadata chunk: {e}", file=sys.stderr)
     return metadata_map
 
-def batch_fetch_article_summaries(article_titles, session):
-    """Batch-fetch 1-sentence summaries and thumbnails from Wikipedia in chunks of 50."""
-    summary_map = {}
-    chunk_size = 50
-
-    for i in range(0, len(article_titles), chunk_size):
-        chunk = article_titles[i:i + chunk_size]
-        titles = "|".join([a.replace("_", " ") for a in chunk])
-        url = (
-            "https://en.wikipedia.org/w/api.php"
-            f"?action=query&titles={urllib.parse.quote(titles)}"
-            "&prop=extracts|pageimages&exintro=1&explaintext=1&exsentences=1"
-            "&pithumbsize=500&format=json&formatversion=2"
-        )
-        try:
-            res = session.get(url, headers={"User-Agent": USER_AGENT}, timeout=15)
-            if res.status_code == 200:
-                for p in res.json().get("query", {}).get("pages", []):
-                    key = p.get("title", "").replace(" ", "_")
-                    summary_map[key] = {
-                        "summary": p.get("extract", "No summary available."),
-                        "image_url": p.get("thumbnail", {}).get("source", ""),
-                    }
-        except requests.RequestException as e:
-            print(f"Error fetching Wikipedia extracts: {e}", file=sys.stderr)
-
-    return summary_map
-
-def resolve_verified_mp3(file_info):
-    """
-    Returns the authoritative MP3 derivative provided by TimedMediaHandler,
-    or falls back to the deterministic transcoded path without blocking on HEAD.
-    """
-    if not file_info:
-        return None
-
-    # 1. Did the API return a verified MP3 derivative?
-    if file_info.get("transcoded_mp3"):
-        return file_info["transcoded_mp3"]
-
-    # 2. If the original uploaded file is already an MP3:
-    raw_url = file_info.get("url", "")
-    if raw_url.lower().endswith(".mp3"):
-        return raw_url
-
-    # 3. Construct canonical TimedMediaHandler URL (https://upload.wikimedia.org/...)
-    if "upload.wikimedia.org" in raw_url:
-        filename = raw_url.split("/")[-1]
-        transcoded_url = raw_url.replace("/commons/", "/commons/transcoded/")
-        transcoded_url = transcoded_url.replace("/en/", "/en/transcoded/")
-        return f"{transcoded_url}/{filename}.mp3"
-
-    return None
+def filter_and_deduplicate(raw_records, metadata_map):
+    grouped = {}
+    for article, audio in raw_records:
+        if audio not in metadata_map:
+            continue
+        info = metadata_map[audio]
+        size = int(info.get("size", 0))
+        
+        if size < MIN_FILE_SIZE_BYTES:
+            continue
+            
+        if not re.search(r'(?i)(article|spoken|wiki|^en-)', audio):
+            continue
+            
+        if article not in grouped:
+            grouped[article] = []
+        grouped[article].append((audio, info))
+        
+    final_items = []
+    for article, files in grouped.items():
+        is_multipart = any(re.search(r'(?i)(part\s*\d+|\d+\s*of\s*\d+)', f[0]) for f in files)
+        if is_multipart:
+            final_items.extend([(article, f[0], f[1]) for f in files])
+            continue
+            
+        def get_ts(f_tuple):
+            try:
+                return parse(f_tuple[1].get("timestamp", "")).timestamp()
+            except Exception:
+                return 0
+                
+        files_sorted = sorted(files, key=get_ts, reverse=True)
+        newest_audio, newest_info = files_sorted[0]
+        newest_size = int(newest_info.get("size", 0))
+        
+        selected_audio, selected_info = newest_audio, newest_info
+        for older_audio, older_info in files_sorted[1:]:
+            if int(older_info.get("size", 0)) > (newest_size * 1.3):
+                selected_audio, selected_info = older_audio, older_info
+                break
+                
+        final_items.append((article, selected_audio, selected_info))
+        
+    return final_items
 
 def extract_metadata_fields(info):
-    """Parse author, licensing, and standardized timestamps from image metadata."""
     author = info.get("user", "Wikipedia Volunteers")
     extmetadata = info.get("extmetadata", {})
-
     if "Artist" in extmetadata and "value" in extmetadata["Artist"]:
         clean_author = re.sub(r"<[^<]+?>", "", extmetadata["Artist"]["value"]).strip()
-        clean_author = clean_author.replace("Speaker: ", "").replace("User: ", "")
-        clean_author = clean_author.replace("\nAuthors of the article", "").strip()
+        clean_author = clean_author.replace("Speaker: ", "").replace("User: ", "").replace("\nAuthors of the article", "").strip()
         if clean_author:
             author = clean_author
 
-    license_name = "Unknown"
-    if "LicenseShortName" in extmetadata and "value" in extmetadata["LicenseShortName"]:
-        license_name = extmetadata["LicenseShortName"]["value"]
-
+    license_name = extmetadata.get("LicenseShortName", {}).get("value", "Unknown")
     filedate_str = info.get("timestamp", "")
     if "DateTimeOriginal" in extmetadata and "value" in extmetadata["DateTimeOriginal"]:
         orig = re.sub(r"<[^<]+?>", "", extmetadata["DateTimeOriginal"]["value"]).strip()
@@ -246,142 +176,108 @@ def extract_metadata_fields(info):
     try:
         dt = parse(filedate_str)
         if not dt.tzinfo:
-            pub_date = dt.strftime("%a, %d %b %Y %H:%M:%S +0000")
-        else:
-            pub_date = dt.strftime("%a, %d %b %Y %H:%M:%S %z")
+            dt = dt.replace(tzinfo=timezone.utc)
+        pub_date = format_datetime(dt)
         human_date = dt.strftime("%B %d, %Y")
     except Exception:
-        pub_date = "Wed, 02 Oct 2002 08:00:00 +0000"
+        fallback_dt = datetime(2002, 10, 2, 8, 0, tzinfo=timezone.utc)
+        pub_date = format_datetime(fallback_dt)
         human_date = "Unknown"
 
     return author, license_name, pub_date, human_date
 
+def resolve_verified_mp3(file_info):
+    if not file_info:
+        return None
+    if file_info.get("transcoded_mp3"):
+        return file_info["transcoded_mp3"]
+    raw_url = file_info.get("url", "")
+    if raw_url.lower().endswith(".mp3"):
+        return raw_url
+    if "upload.wikimedia.org" in raw_url:
+        filename = raw_url.split("/")[-1]
+        transcoded_url = raw_url.replace("/commons/", "/commons/transcoded/").replace("/en/", "/en/transcoded/")
+        return f"{transcoded_url}/{filename}.mp3"
+    return None
+
 def generate_rss_feed(output_path, limit):
-    """Coordinates database reads, batch lookups, and atomic XML delivery."""
+    print(f"Querying MariaDB replica for spoken articles (Limit: {limit})...")
+    raw_records = fetch_spoken_records(limit)
+    print(f"Retrieved {len(raw_records)} media transclusions from database.")
+
     session = requests.Session()
+    unique_files = list(set([f for _, f in raw_records]))
+    print(f"Batch fetching Commons metadata for {len(unique_files)} files...")
+    metadata_map = batch_fetch_commons_metadata(unique_files, session)
+    
+    print("Filtering and deduplicating records...")
+    filtered_records = filter_and_deduplicate(raw_records, metadata_map)
 
-    print(f"Querying MariaDB replica for spoken articles (Limit: {limit or 'ALL'})...", file=sys.stderr)
-    records = fetch_spoken_records(limit=limit)
-    print(f"Retrieved {len(records)} media transclusions from database.", file=sys.stderr)
-
-    unique_files = list({rec[1] for rec in records})
-    unique_articles = list({rec[0] for rec in records})
-
-    print(f"Batch fetching Commons metadata for {len(unique_files)} files...", file=sys.stderr)
-    commons_meta = batch_fetch_commons_metadata(unique_files, session)
-
-    print(f"Batch fetching Wikipedia extracts for {len(unique_articles)} articles...", file=sys.stderr)
-    wiki_meta = batch_fetch_article_summaries(unique_articles, session)
-
-    items_xml = []
+    xml_items = []
     skipped_count = 0
 
-    print("Verifying audio transcode availability and building feed items...", file=sys.stderr)
-    for article_title, audio_file in records:
-        norm_file = audio_file.replace(" ", "_")
-        file_info = commons_meta.get(norm_file)
-        if not file_info:
-            print(f"Skipping {audio_file}: No file metadata returned.", file=sys.stderr)
-            skipped_count += 1
-            continue
-
+    print("Verifying audio transcode availability and building feed items...")
+    for article, audio_file, file_info in filtered_records:
         mp3_url = resolve_verified_mp3(file_info)
         if not mp3_url:
-            print(f"Skipping {audio_file}: Missing transcoded MP3 stream.", file=sys.stderr)
             skipped_count += 1
             continue
 
-        episode_title = format_episode_title(article_title, audio_file)
-        article_display = article_title.replace("_", " ")
-        article_data = wiki_meta.get(article_title, {})
-        summary = article_data.get("summary", "No summary available.")
-        cover_image = article_data.get("image_url", "")
-
-        author, license_name, pub_date, human_date = extract_metadata_fields(file_info)
-
-        item_desc = (
-            f"<p>{html.escape(summary)}</p>"
-            f"<p>This is a spoken word version of the Wikipedia article &quot;{html.escape(article_display)}&quot; "
-            f"recorded on {html.escape(human_date)}.</p>"
-            f"<p>Read by: {html.escape(author)}<br />License: {html.escape(license_name)}</p>"
-        )
-
-        image_tag = f'\n      <itunes:image href="{html.escape(cover_image)}" />' if cover_image else ""
+        raw_author, license_name, pub_date, human_date = extract_metadata_fields(file_info)
+        
+        # XML Escape critical string fields
+        clean_article = escape(article.replace("_", " "))
+        author = escape(raw_author)
+        article_url = f"https://en.wikipedia.org/wiki/{urllib.parse.quote(article)}"
+        
+        desc = (f"<![CDATA[<p>This is a spoken word version of the Wikipedia article "
+                f"\"{clean_article}\" recorded on {human_date}.</p>"
+                f"<p>Read by: {author}<br />License: {license_name}</p>]]>")
 
         item_xml = f"""    <item>
-      <title>{html.escape(episode_title)}</title>
-      <link>{html.escape(mp3_url)}</link>
-      <guid isPermaLink="false">{html.escape(mp3_url)}</guid>
+      <title>{clean_article}</title>
+      <link>{article_url}</link>
+      <guid isPermaLink="false">{mp3_url}</guid>
       <pubDate>{pub_date}</pubDate>
-      <enclosure url="{html.escape(mp3_url)}" type="audio/mpeg" />
-      <description><![CDATA[{item_desc}]]></description>{image_tag}
-      <itunes:author>{html.escape(author)}</itunes:author>
-      <itunes:explicit>no</itunes:explicit>
-    </item>\n"""
-        items_xml.append(item_xml)
+      <enclosure url="{mp3_url}" type="audio/mpeg" />
+      <description>{desc}</description>
+      <itunes:author>{author}</itunes:author>
+    </item>"""
+        xml_items.append(item_xml)
 
-    # Resolve output directories
-    target_path = os.path.abspath(output_path)
-    target_dir = os.path.dirname(target_path)
-    if not os.path.exists(target_dir):
-        try:
-            os.makedirs(target_dir, exist_ok=True)
-        except OSError:
-            target_path = os.path.abspath("sw.rss")
-            target_dir = os.path.dirname(target_path)
+    items_str = "\n".join(xml_items)
+    feed_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0">
+  <channel>
+    <title>{escape(FEED_TITLE)}</title>
+    <link>{FEED_LINK}</link>
+    <language>{FEED_LANGUAGE}</language>
+    <itunes:category text="{escape(FEED_CATEGORY)}" />
+    <itunes:explicit>{FEED_EXPLICIT}</itunes:explicit>
+    <description>{escape(FEED_DESCRIPTION)}</description>
+    <itunes:image href="{FEED_IMAGE}" />
+    <itunes:owner>
+      <itunes:name>{escape(FEED_OWNER_NAME)}</itunes:name>
+      <itunes:email>{FEED_OWNER_EMAIL}</itunes:email>
+    </itunes:owner>
+{items_str}
+  </channel>
+</rss>"""
 
-    # Atomic write pattern
-    with tempfile.NamedTemporaryFile("w", dir=target_dir, delete=False, encoding="utf-8") as tf:
-        temp_file_path = tf.name
-        tf.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-        tf.write(
-            '<rss xmlns:atom="http://www.w3.org/2005/Atom" '
-            'xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" '
-            'xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0">\n'
-        )
-        tf.write("  <channel>\n")
-        tf.write(f"    <title>{html.escape(FEED_CONFIG['title'])}</title>\n")
-        tf.write(f"    <link>{html.escape(FEED_CONFIG['url'])}</link>\n")
-        tf.write(f"    <language>{html.escape(FEED_CONFIG['language'])}</language>\n")
-        tf.write(f'    <itunes:category text="{html.escape(FEED_CONFIG["category"])}" />\n')
-        tf.write(f"    <description>{html.escape(FEED_CONFIG['description'])}</description>\n")
-        tf.write(f'    <itunes:image href="{html.escape(FEED_CONFIG["cover_image"])}" />\n')
-        tf.write("    <itunes:owner>\n")
-        tf.write(f"      <itunes:name>{html.escape(FEED_CONFIG['owner_name'])}</itunes:name>\n")
-        tf.write(f"      <itunes:email>{html.escape(FEED_CONFIG['owner_email'])}</itunes:email>\n")
-        tf.write("    </itunes:owner>\n")
-
-        for item in items_xml:
-            tf.write(item)
-
-        tf.write("  </channel>\n</rss>\n")
-
-    os.replace(temp_file_path, target_path)
-    print(
-        f"Feed generation complete: {len(items_xml)} items written to {target_path} "
-        f"({skipped_count} skipped).", 
-        file=sys.stderr
-    )
-
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with tempfile.NamedTemporaryFile('w', encoding='utf-8', delete=False, dir=os.path.dirname(output_path)) as tf:
+        tf.write(feed_xml)
+        temp_name = tf.name
+    os.replace(temp_name, output_path)
+    os.chmod(output_path, 0o644)
+    print(f"Feed generation complete: {len(xml_items)} items written to {output_path} ({skipped_count} skipped).")
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate Spoken Wikipedia podcast RSS feed on Toolforge.")
-    parser.add_argument(
-        "--limit", 
-        type=int, 
-        default=MAX_ARTICLES, 
-        help=f"Maximum number of articles to process (0 for all, default: {MAX_ARTICLES})"
-    )
-    parser.add_argument(
-        "--out", 
-        type=str, 
-        default=DEFAULT_OUTPUT_PATH, 
-        help=f"Target output RSS file (default: {DEFAULT_OUTPUT_PATH})"
-    )
+    parser = argparse.ArgumentParser(description="Generate Spoken Wikipedia RSS Feed")
+    parser.add_argument("--limit", type=int, default=0, help="Limit number of articles processed")
+    parser.add_argument("--out", type=str, default="/data/project/sw/public_html/sw.rss", help="Output path")
     args = parser.parse_args()
     generate_rss_feed(args.out, args.limit)
 
-
 if __name__ == "__main__":
     main()
-    
