@@ -24,7 +24,7 @@ FEED_IMAGE = "https://sw.toolforge.org/cover.jpg"
 FEED_OWNER_NAME = "Joseph Morris"
 FEED_OWNER_EMAIL = "joe@morris.cloud"
 
-USER_AGENT = "SpokenWikipediaPodcaster/2.1 (https://github.com/xenotropic/spoken-wikipedia-rss; joe@morris.cloud)"
+USER_AGENT = "SpokenWikipediaPodcaster/2.1.1 (https://github.com/xenotropic/spoken-wikipedia-rss; joe@morris.cloud)"
 DB_HOST = "enwiki.analytics.db.svc.wikimedia.cloud"
 DB_NAME = "enwiki_p"
 MIN_FILE_SIZE_BYTES = 1500000
@@ -51,6 +51,7 @@ def fetch_spoken_records(limit=0):
     JOIN imagelinks il ON il.il_from = p.page_id
     JOIN linktarget lt_img ON il.il_target_id = lt_img.lt_id
     WHERE lt_cat.lt_title = 'Spoken_articles'
+      AND lt_cat.lt_namespace = 14
       AND p.page_namespace = 0
     {limit_clause};
     """
