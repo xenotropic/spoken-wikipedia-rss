@@ -24,7 +24,7 @@ FEED_IMAGE = "https://sw.toolforge.org/cover.jpg"
 FEED_OWNER_NAME = "Joseph Morris"
 FEED_OWNER_EMAIL = "joe@morris.cloud"
 
-USER_AGENT = "SpokenWikipediaPodcaster/2.0 (https://github.com/xenotropic/spoken-wikipedia-rss; joe@morris.cloud)"
+USER_AGENT = "SpokenWikipediaPodcaster/2.1 (https://github.com/xenotropic/spoken-wikipedia-rss; joe@morris.cloud)"
 DB_HOST = "enwiki.analytics.db.svc.wikimedia.cloud"
 DB_NAME = "enwiki_p"
 MIN_FILE_SIZE_BYTES = 1500000
@@ -145,8 +145,8 @@ def batch_fetch_file_metadata(filenames, session):
             print(f"Error fetching metadata chunk: {e}", file=sys.stderr)
     return metadata_map
 
-def batch_fetch_article_images(articles, session):
-    image_map = {}
+def batch_fetch_article_extras(articles, session):
+    extras_map = {}
     chunk_size = 50
     for i in range(0, len(articles), chunk_size):
         chunk = articles[i:i + chunk_size]
@@ -155,8 +155,11 @@ def batch_fetch_article_images(articles, session):
         payload = {
             "action": "query",
             "titles": titles,
-            "prop": "pageimages",
+            "prop": "pageimages|extracts",
             "pithumbsize": "500",
+            "exsentences": "2",
+            "exintro": "1",
+            "explaintext": "1",
             "format": "json",
             "formatversion": "2"
         }
@@ -165,11 +168,14 @@ def batch_fetch_article_images(articles, session):
             if res.status_code == 200:
                 pages = res.json().get("query", {}).get("pages", [])
                 for p in pages:
-                    if "thumbnail" in p:
-                        image_map[p["title"]] = p["thumbnail"].get("source")
+                    title = p.get("title")
+                    extras_map[title] = {
+                        "image": p.get("thumbnail", {}).get("source"),
+                        "extract": p.get("extract", "").strip()
+                    }
         except requests.RequestException as e:
-            print(f"Error fetching article images chunk: {e}", file=sys.stderr)
-    return image_map
+            print(f"Error fetching article extras chunk: {e}", file=sys.stderr)
+    return extras_map
 
 def filter_and_deduplicate(raw_records, metadata_map, whitelist_set):
     grouped = {}
@@ -292,11 +298,11 @@ def resolve_verified_mp3(file_info):
         
     return None
 
-def write_feed(items, output_path, is_explicit_feed, image_map):
+def write_feed(items, output_path, is_explicit_feed, extras_map):
     xml_items = []
     skipped_count = 0
     
-    explicit_flag = "true" if is_explicit_feed else "false"
+    explicit_flag = "yes" if is_explicit_feed else "false"
     feed_title = f"{FEED_TITLE} (Explicit)" if is_explicit_feed else FEED_TITLE
 
     for article, audio_file, file_info in items:
@@ -309,14 +315,19 @@ def write_feed(items, output_path, is_explicit_feed, image_map):
         
         clean_article = escape(article.replace("_", " "))
         author = escape(raw_author)
-        article_url_xml = escape(f"https://en.wikipedia.org/wiki/{urllib.parse.quote(article)}")
+        article_url_raw = f"https://en.wikipedia.org/wiki/{urllib.parse.quote(article)}"
+        article_url_xml = escape(article_url_raw)
         mp3_url_xml = escape(mp3_url)
         
-        image_url = image_map.get(article.replace("_", " "))
-        image_tag = f'\n      <itunes:image href="{escape(image_url)}" />' if image_url else ""
+        extras = extras_map.get(article.replace("_", " "), {})
+        image_url = extras.get("image")
+        extract = extras.get("extract", "")
         
-        desc = (f"<![CDATA[<p>This is a spoken word version of the Wikipedia article "
-                f"\"{clean_article}\" recorded on {human_date}.</p>"
+        image_tag = f'\n      <itunes:image href="{escape(image_url)}" />' if image_url else ""
+        extract_html = f"<p>{escape(extract)}</p>" if extract else ""
+        
+        desc = (f"<![CDATA[{extract_html}<p>This is a spoken word version of the Wikipedia article "
+                f"<a href=\"{article_url_xml}\">{clean_article}</a> recorded on {human_date}.</p>"
                 f"<p>Read by: {author}<br />License: {license_name}</p>]]>")
 
         item_xml = f"""    <item>
@@ -380,13 +391,12 @@ def generate_rss_feeds(out_clean, out_explicit, explicit_list_path, limit):
     filtered_records = filter_and_deduplicate(raw_records, metadata_map, all_whitelist)
     
     unique_articles = list(set([r[0] for r in filtered_records]))
-    print(f"Batch fetching page images for {len(unique_articles)} articles...")
-    image_map = batch_fetch_article_images(unique_articles, session)
+    print(f"Batch fetching page images and extracts for {len(unique_articles)} articles...")
+    extras_map = batch_fetch_article_extras(unique_articles, session)
 
     clean_items = []
     explicit_items = []
     
-    # Regex to catch explicit words anywhere in the article title
     profanity_pattern = re.compile(r'(?i)\b(bitch|shit|fuck|piss)')
 
     for article, audio_file, file_info in filtered_records:
@@ -403,8 +413,8 @@ def generate_rss_feeds(out_clean, out_explicit, explicit_list_path, limit):
         if not is_explicit:
             clean_items.append((article, audio_file, file_info))
 
-    write_feed(clean_items, out_clean, False, image_map)
-    write_feed(explicit_items, out_explicit, True, image_map)
+    write_feed(clean_items, out_clean, False, extras_map)
+    write_feed(explicit_items, out_explicit, True, extras_map)
 
 def main():
     parser = argparse.ArgumentParser(description="Generate Spoken Wikipedia RSS Feeds")
