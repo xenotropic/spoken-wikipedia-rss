@@ -24,7 +24,7 @@ FEED_IMAGE = "https://sw.toolforge.org/cover.jpg"
 FEED_OWNER_NAME = "Joseph Morris"
 FEED_OWNER_EMAIL = "joe@morris.cloud"
 
-USER_AGENT = "SpokenWikipediaPodcaster/2.1.1 (https://github.com/xenotropic/spoken-wikipedia-rss; joe@morris.cloud)"
+USER_AGENT = "SpokenWikipediaPodcaster/2.1.2 (https://github.com/xenotropic/spoken-wikipedia-rss; joe@morris.cloud)"
 DB_HOST = "enwiki.analytics.db.svc.wikimedia.cloud"
 DB_NAME = "enwiki_p"
 MIN_FILE_SIZE_BYTES = 1500000
@@ -257,19 +257,21 @@ def extract_metadata_fields(info):
             author = clean_author
 
     license_name = extmetadata.get("LicenseShortName", {}).get("value", "Unknown")
-    filedate_str = info.get("timestamp", "")
+    
+    filedate_str = None
     if "DateTimeOriginal" in extmetadata and "value" in extmetadata["DateTimeOriginal"]:
-        orig = re.sub(r"<[^<]+?>", "", extmetadata["DateTimeOriginal"]["value"]).strip()
-        end_match = re.search(r"\d{4}", orig)
-        if end_match:
-            orig = orig[:end_match.end()]
-        try:
-            parse(orig)
-            filedate_str = orig
-        except (ValueError, TypeError):
-            pass
-
+        filedate_str = re.sub(r"<[^<]+?>", "", extmetadata["DateTimeOriginal"]["value"]).strip()
+    elif "DateTime" in extmetadata and "value" in extmetadata["DateTime"]:
+        filedate_str = re.sub(r"<[^<]+?>", "", extmetadata["DateTime"]["value"]).strip()
+    
+    if not filedate_str:
+        filedate_str = info.get("timestamp", "")
+        
     try:
+        end_match = re.search(r"\d{4}", filedate_str)
+        if end_match and "DateTimeOriginal" in extmetadata: 
+             filedate_str = filedate_str[:end_match.end()]
+        
         dt = parse(filedate_str)
         if not dt.tzinfo:
             dt = dt.replace(tzinfo=timezone.utc)
@@ -303,7 +305,7 @@ def write_feed(items, output_path, is_explicit_feed, extras_map):
     xml_items = []
     skipped_count = 0
     
-    explicit_flag = "yes" if is_explicit_feed else "false"
+    explicit_flag = "true" if is_explicit_feed else "false"
     feed_title = f"{FEED_TITLE} (Explicit)" if is_explicit_feed else FEED_TITLE
 
     for article, audio_file, file_info in items:
