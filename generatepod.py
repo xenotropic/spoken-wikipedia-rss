@@ -16,7 +16,7 @@ from email.utils import format_datetime
 # ==========================================
 
 # AGENTS: Increment this version code every time you modify this script.
-SCRIPT_VERSION = "2.1.3"
+SCRIPT_VERSION = "2.1.4"
 
 FEED_TITLE = "Spoken Wikipedia"
 FEED_LINK = "https://sw.toolforge.org/"
@@ -91,7 +91,7 @@ def fetch_index_whitelist(session):
                     header_title = header_match.group(1).lower()
                     is_explicit_section = ('human sexuality' in header_title)
                     
-                matches = re.findall(r'\[\[:?(?:File\vert{}Image\vert{}Media):([^\vert{}\]]+\.(?:ogg|oga|mp3|flac|wav|opus))', line, re.IGNORECASE)
+                matches = re.findall(r'\[\[:?(?:File|Image|Media):([^|\]]+\.(?:ogg|oga|mp3|flac|wav|opus))', line, re.IGNORECASE)
                 for m in matches:
                     fname = m.strip().replace(' ', '_')
                     all_whitelist.add(fname)
@@ -214,7 +214,6 @@ def filter_and_deduplicate(raw_records, metadata_map, whitelist_set):
     for article, files in grouped.items():
         versions = {}
         for audio_file, info in files:
-            # Safe parsing for grouping
             ts = 0
             date_str = "1970-01-01"
             api_timestamp = info.get("timestamp", "")
@@ -274,7 +273,6 @@ def extract_metadata_fields(info):
         
     if filedate_str:
         try:
-            # Default to Jan 1st of the year provided to avoid current execution date insertion
             dt = parse(filedate_str, default=datetime(1970, 1, 1, tzinfo=timezone.utc))
         except (ValueError, TypeError):
             pass
@@ -406,4 +404,43 @@ def generate_rss_feeds(out_clean, out_explicit, explicit_list_path, limit):
     metadata_map = batch_fetch_file_metadata(unique_files, session)
     
     print("Filtering and deduplicating records...")
-    filtered_records = filter_and_deduplicate(raw_
+    filtered_records = filter_and_deduplicate(raw_records, metadata_map, all_whitelist)
+    
+    unique_articles = list(set([r[0] for r in filtered_records]))
+    print(f"Batch fetching page images and extracts for {len(unique_articles)} articles...")
+    extras_map = batch_fetch_article_extras(unique_articles, session)
+
+    clean_items = []
+    explicit_items = []
+    
+    profanity_pattern = re.compile(r'(?i)\b(bitch|shit|fuck|piss)')
+
+    for article, audio_file, file_info in filtered_records:
+        is_explicit = False
+        
+        if audio_file in explicit_whitelist:
+            is_explicit = True
+        elif article.replace(' ', '_') in explicit_titles_set:
+            is_explicit = True
+        elif profanity_pattern.search(article):
+            is_explicit = True
+            
+        explicit_items.append((article, audio_file, file_info))
+        if not is_explicit:
+            clean_items.append((article, audio_file, file_info))
+
+    write_feed(clean_items, out_clean, False, extras_map)
+    write_feed(explicit_items, out_explicit, True, extras_map)
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate Spoken Wikipedia RSS Feeds")
+    parser.add_argument("--limit", type=int, default=0, help="Limit number of articles processed")
+    parser.add_argument("--out-clean", type=str, default="/data/project/sw/public_html/sw.rss", help="Output path for the clean feed")
+    parser.add_argument("--out-explicit", type=str, default="/data/project/sw/public_html/sw-explicit.rss", help="Output path for the explicit feed")
+    parser.add_argument("--explicit-list", type=str, default="/data/project/sw/spoken-wikipedia-rss/explicit-only.txt", help="Path to text file containing article titles to exclude from clean feed")
+    args = parser.parse_args()
+    
+    generate_rss_feeds(args.out_clean, args.out_explicit, args.explicit_list, args.limit)
+
+if __name__ == "__main__":
+    main()
