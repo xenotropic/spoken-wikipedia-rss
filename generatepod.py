@@ -15,6 +15,9 @@ from email.utils import format_datetime
 # USER CONFIGURATION
 # ==========================================
 
+# AGENTS: Increment this version code every time you modify this script.
+SCRIPT_VERSION = "2.1.3"
+
 FEED_TITLE = "Spoken Wikipedia"
 FEED_LINK = "https://sw.toolforge.org/"
 FEED_LANGUAGE = "en-us"
@@ -24,7 +27,7 @@ FEED_IMAGE = "https://sw.toolforge.org/cover.jpg"
 FEED_OWNER_NAME = "Joseph Morris"
 FEED_OWNER_EMAIL = "joe@morris.cloud"
 
-USER_AGENT = "SpokenWikipediaPodcaster/2.1.2 (https://github.com/xenotropic/spoken-wikipedia-rss; joe@morris.cloud)"
+USER_AGENT = f"SpokenWikipediaPodcaster/{SCRIPT_VERSION} (https://github.com/xenotropic/spoken-wikipedia-rss; joe@morris.cloud)"
 DB_HOST = "enwiki.analytics.db.svc.wikimedia.cloud"
 DB_NAME = "enwiki_p"
 MIN_FILE_SIZE_BYTES = 1500000
@@ -88,7 +91,7 @@ def fetch_index_whitelist(session):
                     header_title = header_match.group(1).lower()
                     is_explicit_section = ('human sexuality' in header_title)
                     
-                matches = re.findall(r'\[\[:?(?:File|Image|Media):([^|\]]+\.(?:ogg|oga|mp3|flac|wav|opus))', line, re.IGNORECASE)
+                matches = re.findall(r'\[\[:?(?:File\vert{}Image\vert{}Media):([^\vert{}\]]+\.(?:ogg|oga|mp3|flac|wav|opus))', line, re.IGNORECASE)
                 for m in matches:
                     fname = m.strip().replace(' ', '_')
                     all_whitelist.add(fname)
@@ -211,13 +214,17 @@ def filter_and_deduplicate(raw_records, metadata_map, whitelist_set):
     for article, files in grouped.items():
         versions = {}
         for audio_file, info in files:
-            try:
-                dt = parse(info.get("timestamp", ""))
-                ts = dt.timestamp()
-                date_str = dt.strftime("%Y-%m-%d")
-            except Exception:
-                ts = 0
-                date_str = "1970-01-01"
+            # Safe parsing for grouping
+            ts = 0
+            date_str = "1970-01-01"
+            api_timestamp = info.get("timestamp", "")
+            if api_timestamp:
+                try:
+                    dt = parse(api_timestamp, default=datetime(1970, 1, 1, tzinfo=timezone.utc))
+                    ts = dt.timestamp()
+                    date_str = dt.strftime("%Y-%m-%d")
+                except Exception:
+                    pass
                 
             user = info.get("user", "Unknown")
             v_key = (user, date_str)
@@ -258,29 +265,36 @@ def extract_metadata_fields(info):
 
     license_name = extmetadata.get("LicenseShortName", {}).get("value", "Unknown")
     
+    dt = None
     filedate_str = None
     if "DateTimeOriginal" in extmetadata and "value" in extmetadata["DateTimeOriginal"]:
         filedate_str = re.sub(r"<[^<]+?>", "", extmetadata["DateTimeOriginal"]["value"]).strip()
     elif "DateTime" in extmetadata and "value" in extmetadata["DateTime"]:
         filedate_str = re.sub(r"<[^<]+?>", "", extmetadata["DateTime"]["value"]).strip()
-    
-    if not filedate_str:
-        filedate_str = info.get("timestamp", "")
         
-    try:
-        end_match = re.search(r"\d{4}", filedate_str)
-        if end_match and "DateTimeOriginal" in extmetadata: 
-             filedate_str = filedate_str[:end_match.end()]
+    if filedate_str:
+        try:
+            # Default to Jan 1st of the year provided to avoid current execution date insertion
+            dt = parse(filedate_str, default=datetime(1970, 1, 1, tzinfo=timezone.utc))
+        except (ValueError, TypeError):
+            pass
+
+    if not dt:
+        api_timestamp = info.get("timestamp", "")
+        if api_timestamp:
+            try:
+                dt = parse(api_timestamp, default=datetime(1970, 1, 1, tzinfo=timezone.utc))
+            except (ValueError, TypeError):
+                pass
+                
+    if not dt:
+        dt = datetime(2002, 10, 2, 8, 0, tzinfo=timezone.utc)
         
-        dt = parse(filedate_str)
-        if not dt.tzinfo:
-            dt = dt.replace(tzinfo=timezone.utc)
-        pub_date = format_datetime(dt)
-        human_date = dt.strftime("%B %d, %Y")
-    except Exception:
-        fallback_dt = datetime(2002, 10, 2, 8, 0, tzinfo=timezone.utc)
-        pub_date = format_datetime(fallback_dt)
-        human_date = "Unknown"
+    if not dt.tzinfo:
+        dt = dt.replace(tzinfo=timezone.utc)
+        
+    pub_date = format_datetime(dt)
+    human_date = dt.strftime("%B %d, %Y")
 
     return author, license_name, pub_date, human_date
 
@@ -353,6 +367,7 @@ def write_feed(items, output_path, is_explicit_feed, extras_map):
     <language>{escape(FEED_LANGUAGE)}</language>
     <itunes:category text="{escape(FEED_CATEGORY)}" />
     <itunes:explicit>{explicit_flag}</itunes:explicit>
+    <generator>Spoken Wikipedia Podcaster v{escape(SCRIPT_VERSION)}</generator>
     <description>{escape(FEED_DESCRIPTION)}</description>
     <itunes:image href="{escape(FEED_IMAGE)}" />
     <itunes:owner>
@@ -369,7 +384,7 @@ def write_feed(items, output_path, is_explicit_feed, extras_map):
         temp_name = tf.name
     os.replace(temp_name, output_path)
     os.chmod(output_path, 0o644)
-    print(f"[{'Explicit' if is_explicit_feed else 'Clean'}] Feed generation complete: {len(xml_items)} items written to {output_path} ({skipped_count} skipped).")
+    print(f"[{'Explicit' if is_explicit_feed else 'Clean'}] Feed generation complete (v{SCRIPT_VERSION}): {len(xml_items)} items written to {output_path} ({skipped_count} skipped).")
 
 def generate_rss_feeds(out_clean, out_explicit, explicit_list_path, limit):
     print(f"Querying MariaDB replica for spoken articles (Limit: {limit})...")
@@ -391,43 +406,4 @@ def generate_rss_feeds(out_clean, out_explicit, explicit_list_path, limit):
     metadata_map = batch_fetch_file_metadata(unique_files, session)
     
     print("Filtering and deduplicating records...")
-    filtered_records = filter_and_deduplicate(raw_records, metadata_map, all_whitelist)
-    
-    unique_articles = list(set([r[0] for r in filtered_records]))
-    print(f"Batch fetching page images and extracts for {len(unique_articles)} articles...")
-    extras_map = batch_fetch_article_extras(unique_articles, session)
-
-    clean_items = []
-    explicit_items = []
-    
-    profanity_pattern = re.compile(r'(?i)\b(bitch|shit|fuck|piss)')
-
-    for article, audio_file, file_info in filtered_records:
-        is_explicit = False
-        
-        if audio_file in explicit_whitelist:
-            is_explicit = True
-        elif article.replace(' ', '_') in explicit_titles_set:
-            is_explicit = True
-        elif profanity_pattern.search(article):
-            is_explicit = True
-            
-        explicit_items.append((article, audio_file, file_info))
-        if not is_explicit:
-            clean_items.append((article, audio_file, file_info))
-
-    write_feed(clean_items, out_clean, False, extras_map)
-    write_feed(explicit_items, out_explicit, True, extras_map)
-
-def main():
-    parser = argparse.ArgumentParser(description="Generate Spoken Wikipedia RSS Feeds")
-    parser.add_argument("--limit", type=int, default=0, help="Limit number of articles processed")
-    parser.add_argument("--out-clean", type=str, default="/data/project/sw/public_html/sw.rss", help="Output path for the clean feed")
-    parser.add_argument("--out-explicit", type=str, default="/data/project/sw/public_html/sw-explicit.rss", help="Output path for the explicit feed")
-    parser.add_argument("--explicit-list", type=str, default="/data/project/sw/spoken-wikipedia-rss/explicit-only.txt", help="Path to text file containing article titles to exclude from clean feed")
-    args = parser.parse_args()
-    
-    generate_rss_feeds(args.out_clean, args.out_explicit, args.explicit_list, args.limit)
-
-if __name__ == "__main__":
-    main()
+    filtered_records = filter_and_deduplicate(raw_
