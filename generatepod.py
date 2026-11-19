@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import urllib.parse
+import html
 import re
 import argparse
 from datetime import datetime, timezone
@@ -16,7 +17,7 @@ from email.utils import format_datetime
 # ==========================================
 
 # AGENTS: Increment this version code every time you modify this script.
-SCRIPT_VERSION = "2.1.4"
+SCRIPT_VERSION = "2.1.5"
 
 FEED_TITLE = "Spoken Wikipedia"
 FEED_LINK = "https://sw.toolforge.org/"
@@ -33,6 +34,17 @@ DB_NAME = "enwiki_p"
 MIN_FILE_SIZE_BYTES = 1500000
 
 # ==========================================
+
+def normalize_wiki_title(title):
+    if not title:
+        return ""
+    cleaned = urllib.parse.unquote(html.unescape(title))
+    cleaned = cleaned.replace('\u200e', '').replace('\u200f', '').strip()
+    cleaned = re.sub(r"'{2,5}", "", cleaned)
+    cleaned = cleaned.replace(' ', '_')
+    if not cleaned:
+        return ""
+    return cleaned[0].upper() + cleaned[1:]
 
 def get_db_connection():
     return pymysql.connect(
@@ -75,32 +87,52 @@ def fetch_index_whitelist(session):
         "action": "parse",
         "page": "Wikipedia:Spoken_articles",
         "prop": "wikitext",
-        "format": "json"
+        "format": "json",
+        "formatversion": "2"
     }
     all_whitelist = set()
-    explicit_whitelist = set()
+    explicit_files = set()
+    explicit_section_titles = set()
     try:
         res = session.get(url, params=params, headers={"User-Agent": USER_AGENT}, timeout=15)
         if res.status_code == 200:
-            wikitext = res.json().get("parse", {}).get("wikitext", {}).get("*", "")
+            data = res.json().get("parse", {}).get("wikitext", "")
+            wikitext = data.get("*", "") if isinstance(data, dict) else data
             
             is_explicit_section = False
             for line in wikitext.split('\n'):
-                header_match = re.match(r'^={1,6}\s*(.*?)\s*={1,6}', line)
+                header_match = re.match(r'^={2,6}\s*(.*?)\s*={2,6}', line)
                 if header_match:
-                    header_title = header_match.group(1).lower()
+                    header_title = header_match.group(1).strip().lower()
                     is_explicit_section = ('human sexuality' in header_title)
-                    
-                matches = re.findall(r'\[\[:?(?:File|Image|Media):([^|\]]+\.(?:ogg|oga|mp3|flac|wav|opus))', line, re.IGNORECASE)
-                for m in matches:
-                    fname = m.strip().replace(' ', '_')
-                    all_whitelist.add(fname)
-                    if is_explicit_section:
-                        explicit_whitelist.add(fname)
+                
+                if is_explicit_section and line.strip().startswith('*'):
+                    prefix_match = re.match(r'^\*\s*(?:\{\{[^}]+\}\}\s*)*([^[\n]+?)\s*\[\[:?(?:File|Image|Media):', line, re.IGNORECASE)
+                    if prefix_match and prefix_match.group(1).strip():
+                        norm_prefix = normalize_wiki_title(prefix_match.group(1).strip())
+                        if norm_prefix:
+                            explicit_section_titles.add(norm_prefix.lower())
+
+                matches = re.findall(
+                    r'\[\[:?(?:File|Image|Media):([^|\]]+\.(?:ogg|oga|mp3|flac|wav|opus))(?:\|([^\]]*))?\]\]',
+                    line,
+                    re.IGNORECASE
+                )
+                for raw_fname, raw_label in matches:
+                    fname = normalize_wiki_title(raw_fname)
+                    if fname:
+                        all_whitelist.add(fname)
+                        if is_explicit_section:
+                            explicit_files.add(fname)
+                            explicit_files.add(fname.lower())
+                    if is_explicit_section and raw_label:
+                        label_clean = normalize_wiki_title(raw_label)
+                        if label_clean and not re.match(r'^\(?part[_\s]\d+\)?$', label_clean, re.IGNORECASE):
+                            explicit_section_titles.add(label_clean.lower())
                         
     except Exception as e:
         print(f"Error fetching index whitelist: {e}", file=sys.stderr)
-    return all_whitelist, explicit_whitelist
+    return all_whitelist, explicit_files, explicit_section_titles
 
 def load_explicit_list(filepath):
     explicit_titles = set()
@@ -109,7 +141,7 @@ def load_explicit_list(filepath):
             for line in f:
                 clean_line = line.strip()
                 if clean_line and not clean_line.startswith('#'):
-                    explicit_titles.add(clean_line.replace(' ', '_'))
+                    explicit_titles.add(normalize_wiki_title(clean_line).lower())
     return explicit_titles
 
 def batch_fetch_file_metadata(filenames, session):
@@ -201,7 +233,7 @@ def filter_and_deduplicate(raw_records, metadata_map, whitelist_set):
         
         has_tag = bool(re.search(r'(?i)(article|spoken|wiki|^en-)', audio))
         has_title = article_lower in audio_lower
-        in_whitelist = audio in whitelist_set
+        in_whitelist = (audio in whitelist_set) or (normalize_wiki_title(audio) in whitelist_set)
         
         if not (has_tag or has_title or in_whitelist):
             continue
@@ -392,8 +424,11 @@ def generate_rss_feeds(out_clean, out_explicit, explicit_list_path, limit):
     session = requests.Session()
     
     print("Fetching whitelist from Wikipedia:Spoken_articles...")
-    all_whitelist, explicit_whitelist = fetch_index_whitelist(session)
-    print(f"Loaded {len(all_whitelist)} approved filenames ({len(explicit_whitelist)} explicitly flagged via section headers).")
+    all_whitelist, explicit_files, explicit_section_titles = fetch_index_whitelist(session)
+    print(
+        f"Loaded {len(all_whitelist)} approved filenames "
+        f"({len(explicit_files) // 2} files and {len(explicit_section_titles)} titles flagged via Human sexuality section)."
+    )
 
     explicit_titles_set = load_explicit_list(explicit_list_path)
     if explicit_titles_set:
@@ -413,22 +448,43 @@ def generate_rss_feeds(out_clean, out_explicit, explicit_list_path, limit):
     clean_items = []
     explicit_items = []
     
-    profanity_pattern = re.compile(r'(?i)\b(bitch|shit|fuck|piss)')
+    # Catch strong profanity anywhere in word (e.g., Motherfucker) and start-of-word piss
+    profanity_pattern = re.compile(r'(?i)(bitch|shit|fuck|cunt|\bpiss)')
+    
+    # Catch unindexed or cross-categorized sexual/anatomical articles
+    sexual_topic_pattern = re.compile(
+        r'(?i)(\b(penis|penile|vagina|vaginal|penectomy|intercourse|bdsm|bondage|'
+        r'fetish|porn|pornography|erotic|masturbat\w*|orgasm|cunnilingus|fellatio|'
+        r'sodomy|bukkake|dildo|vibrator|cleavage|prostitut\w*|brothel|incest|'
+        r'bestiality|zoophilia|necrophilia|pedophil\w*|paedophil\w*|rape)\b|'
+        r'urethral[_\s]+sounding)'
+    )
 
     for article, audio_file, file_info in filtered_records:
         is_explicit = False
+        norm_audio = normalize_wiki_title(audio_file)
+        norm_article_lower = normalize_wiki_title(article).lower()
+        article_spaces = article.replace('_', ' ')
         
-        if audio_file in explicit_whitelist:
-            is_explicit = True
-        elif article.replace(' ', '_') in explicit_titles_set:
-            is_explicit = True
-        elif profanity_pattern.search(article):
+        if (
+            audio_file in explicit_files
+            or audio_file.lower() in explicit_files
+            or norm_audio in explicit_files
+            or norm_audio.lower() in explicit_files
+            or norm_article_lower in explicit_section_titles
+            or norm_article_lower in explicit_titles_set
+            or profanity_pattern.search(article_spaces)
+            or profanity_pattern.search(audio_file)
+            or sexual_topic_pattern.search(article_spaces)
+            or sexual_topic_pattern.search(audio_file)
+        ):
             is_explicit = True
             
         explicit_items.append((article, audio_file, file_info))
         if not is_explicit:
             clean_items.append((article, audio_file, file_info))
 
+    print(f"Classification summary: {len(clean_items)} clean items, {len(explicit_items) - len(clean_items)} explicit-only items excluded from clean feed.")
     write_feed(clean_items, out_clean, False, extras_map)
     write_feed(explicit_items, out_explicit, True, extras_map)
 
