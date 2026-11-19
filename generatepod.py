@@ -8,6 +8,8 @@ import argparse
 from datetime import datetime, timezone
 import pymysql
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from dateutil.parser import parse
 from xml.sax.saxutils import escape
 from email.utils import format_datetime
@@ -16,8 +18,11 @@ from email.utils import format_datetime
 # USER CONFIGURATION
 # ==========================================
 
-# AGENTS: Increment this version code every time you modify this script.
-SCRIPT_VERSION = "2.1.5"
+# AGENTS: Increment SCRIPT_VERSION on every modification using X.Y.Z criteria:
+#   X (Major)  : Breaking changes to CLI flags, output filenames, or RSS schema architecture.
+#   Y (Medium) : New features, new feed outputs, new API properties, or filtering logic changes.
+#   Z (Minor)  : Bug fixes, regex tuning, metadata cleanup, or performance/query optimizations.
+SCRIPT_VERSION = "2.2.0"
 
 FEED_TITLE = "Spoken Wikipedia"
 FEED_LINK = "https://sw.toolforge.org/"
@@ -34,6 +39,20 @@ DB_NAME = "enwiki_p"
 MIN_FILE_SIZE_BYTES = 1500000
 
 # ==========================================
+
+def create_http_session():
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET", "POST"])
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update({"User-Agent": USER_AGENT})
+    return session
 
 def normalize_wiki_title(title):
     if not title:
@@ -57,7 +76,7 @@ def get_db_connection():
 def fetch_spoken_records(limit=0):
     limit_clause = f"LIMIT {int(limit)}" if limit and limit > 0 else ""
     sql = f"""
-    SELECT 
+    SELECT DISTINCT
         CONVERT(p.page_title USING utf8mb4) AS article_title,
         CONVERT(lt_img.lt_title USING utf8mb4) AS audio_file
     FROM categorylinks cl
@@ -68,6 +87,7 @@ def fetch_spoken_records(limit=0):
     WHERE lt_cat.lt_title = 'Spoken_articles'
       AND lt_cat.lt_namespace = 14
       AND p.page_namespace = 0
+      AND lt_img.lt_namespace = 6
     {limit_clause};
     """
     conn = get_db_connection()
@@ -94,7 +114,7 @@ def fetch_index_whitelist(session):
     explicit_files = set()
     explicit_section_titles = set()
     try:
-        res = session.get(url, params=params, headers={"User-Agent": USER_AGENT}, timeout=15)
+        res = session.get(url, params=params, timeout=15)
         if res.status_code == 200:
             data = res.json().get("parse", {}).get("wikitext", "")
             wikitext = data.get("*", "") if isinstance(data, dict) else data
@@ -161,7 +181,7 @@ def batch_fetch_file_metadata(filenames, session):
             "formatversion": "2"
         }
         try:
-            res = session.post(url, data=payload, headers={"User-Agent": USER_AGENT}, timeout=20)
+            res = session.post(url, data=payload, timeout=20)
             if res.status_code == 200:
                 pages = res.json().get("query", {}).get("pages", [])
                 for p in pages:
@@ -183,7 +203,8 @@ def batch_fetch_file_metadata(filenames, session):
 
 def batch_fetch_article_extras(articles, session):
     extras_map = {}
-    chunk_size = 50
+    # MediaWiki TextExtracts enforces exlimit <= 20 per request
+    chunk_size = 20
     for i in range(0, len(articles), chunk_size):
         chunk = articles[i:i + chunk_size]
         titles = "|".join([a.replace('_', ' ') for a in chunk])
@@ -193,20 +214,24 @@ def batch_fetch_article_extras(articles, session):
             "titles": titles,
             "prop": "pageimages|extracts",
             "pithumbsize": "500",
+            "pilimit": "max",
             "exsentences": "2",
+            "exlimit": "max",
             "exintro": "1",
             "explaintext": "1",
             "format": "json",
             "formatversion": "2"
         }
         try:
-            res = session.post(url, data=payload, headers={"User-Agent": USER_AGENT}, timeout=20)
+            res = session.post(url, data=payload, timeout=20)
             if res.status_code == 200:
                 pages = res.json().get("query", {}).get("pages", [])
                 for p in pages:
                     title = p.get("title")
+                    raw_img = p.get("thumbnail", {}).get("source")
+                    clean_img = raw_img.split("?")[0] if raw_img else None
                     extras_map[title] = {
-                        "image": p.get("thumbnail", {}).get("source"),
+                        "image": clean_img,
                         "extract": p.get("extract", "").strip()
                     }
         except requests.RequestException as e:
@@ -215,7 +240,12 @@ def batch_fetch_article_extras(articles, session):
 
 def filter_and_deduplicate(raw_records, metadata_map, whitelist_set):
     grouped = {}
+    seen_pairs = set()
     for article, audio in raw_records:
+        if (article, audio) in seen_pairs:
+            continue
+        seen_pairs.add((article, audio))
+
         if audio not in metadata_map:
             continue
         info = metadata_map[audio]
@@ -280,21 +310,36 @@ def filter_and_deduplicate(raw_records, metadata_map, whitelist_set):
                 selected_version = older_version
                 break
                 
-        for audio_file, info in selected_version["files"]:
-            final_items.append((article, audio_file, info))
+        sorted_files = sorted(selected_version["files"], key=lambda x: x[0].lower())
+        total_parts = len(sorted_files)
+        for idx, (audio_file, info) in enumerate(sorted_files, start=1):
+            final_items.append((article, audio_file, info, idx, total_parts))
         
     return final_items
 
+def clean_author_string(raw_text, fallback_user):
+    if not raw_text:
+        return fallback_user
+    text = re.sub(r"<[^<]+?>", "", raw_text)
+    text = re.sub(r"\[\[(?:[^|\]]*\|)?([^\]]+)\]\]", r"\1", text)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return fallback_user
+    first_line = lines[0]
+    first_line = re.sub(r"^(?:Speaker|User|Read by|Narrated by)\s*:\s*", "", first_line, flags=re.IGNORECASE)
+    first_line = re.sub(r"^en:User:", "", first_line, flags=re.IGNORECASE)
+    first_line = re.sub(r"\s+", " ", first_line).strip()
+    return first_line if first_line else fallback_user
+
 def extract_metadata_fields(info):
-    author = info.get("user", "Wikipedia Volunteers")
+    fallback_user = info.get("user", "Wikipedia Volunteers")
+    author = fallback_user
     extmetadata = info.get("extmetadata", {})
     if "Artist" in extmetadata and "value" in extmetadata["Artist"]:
-        clean_author = re.sub(r"<[^<]+?>", "", extmetadata["Artist"]["value"]).strip()
-        clean_author = clean_author.replace("Speaker: ", "").replace("User: ", "").replace("\nAuthors of the article", "").strip()
-        if clean_author:
-            author = clean_author
+        author = clean_author_string(extmetadata["Artist"]["value"], fallback_user)
 
     license_name = extmetadata.get("LicenseShortName", {}).get("value", "Unknown")
+    license_name = re.sub(r"<[^<]+?>", "", license_name).strip() or "Unknown"
     
     dt = None
     filedate_str = None
@@ -326,7 +371,7 @@ def extract_metadata_fields(info):
     pub_date = format_datetime(dt)
     human_date = dt.strftime("%B %d, %Y")
 
-    return author, license_name, pub_date, human_date
+    return author, license_name, pub_date, human_date, dt.timestamp()
 
 def resolve_verified_mp3(file_info):
     if not file_info:
@@ -346,47 +391,65 @@ def resolve_verified_mp3(file_info):
     return None
 
 def write_feed(items, output_path, is_explicit_feed, extras_map):
-    xml_items = []
+    prepared_entries = []
     skipped_count = 0
     
     explicit_flag = "true" if is_explicit_feed else "false"
     feed_title = f"{FEED_TITLE} (Explicit)" if is_explicit_feed else FEED_TITLE
 
-    for article, audio_file, file_info in items:
+    for article, audio_file, file_info, part_idx, total_parts in items:
         mp3_url = resolve_verified_mp3(file_info)
         if not mp3_url:
             skipped_count += 1
             continue
 
-        raw_author, license_name, pub_date, human_date = extract_metadata_fields(file_info)
+        raw_author, raw_license, pub_date, human_date, sort_ts = extract_metadata_fields(file_info)
         
-        clean_article = escape(article.replace("_", " "))
-        author = escape(raw_author)
+        base_article_title = article.replace("_", " ")
+        display_title = f"{base_article_title} (Part {part_idx} of {total_parts})" if total_parts > 1 else base_article_title
+        
+        clean_title_xml = escape(display_title)
+        clean_article_xml = escape(base_article_title)
+        author_xml = escape(raw_author)
+        license_xml = escape(raw_license)
         article_url_raw = f"https://en.wikipedia.org/wiki/{urllib.parse.quote(article)}"
         article_url_xml = escape(article_url_raw)
         mp3_url_xml = escape(mp3_url)
         
-        extras = extras_map.get(article.replace("_", " "), {})
+        try:
+            file_size = max(0, int(file_info.get("size", 0)))
+        except (ValueError, TypeError):
+            file_size = 0
+        
+        extras = extras_map.get(base_article_title, {})
         image_url = extras.get("image")
         extract = extras.get("extract", "")
         
         image_tag = f'\n      <itunes:image href="{escape(image_url)}" />' if image_url else ""
         extract_html = f"<p>{escape(extract)}</p>" if extract else ""
         
-        desc = (f"<![CDATA[{extract_html}<p>This is a spoken word version of the Wikipedia article "
-                f"<a href=\"{article_url_xml}\">{clean_article}</a> recorded on {human_date}.</p>"
-                f"<p>Read by: {author}<br />License: {license_name}</p>]]>")
+        part_note = f" (Part {part_idx} of {total_parts})" if total_parts > 1 else ""
+        inner_html = (
+            f"{extract_html}<p>This is a spoken word version{escape(part_note)} of the Wikipedia article "
+            f"<a href=\"{article_url_xml}\">{clean_article_xml}</a> recorded on {escape(human_date)}.</p>"
+            f"<p>Read by: {author_xml}<br />License: {license_xml}</p>"
+        ).replace("]]>", "]]]]><![CDATA[>")
+        desc = f"<![CDATA[{inner_html}]]>"
 
         item_xml = f"""    <item>
-      <title>{clean_article}</title>
+      <title>{clean_title_xml}</title>
       <link>{article_url_xml}</link>
       <guid isPermaLink="false">{mp3_url_xml}</guid>
       <pubDate>{pub_date}</pubDate>
-      <enclosure url="{mp3_url_xml}" type="audio/mpeg" />
+      <enclosure url="{mp3_url_xml}" length="{file_size}" type="audio/mpeg" />
       <description>{desc}</description>
-      <itunes:author>{author}</itunes:author>{image_tag}
+      <itunes:author>{author_xml}</itunes:author>{image_tag}
     </item>"""
-        xml_items.append(item_xml)
+        prepared_entries.append((sort_ts, display_title, item_xml))
+
+    # Sort newest episodes first; tie-break alphabetically by display title
+    prepared_entries.sort(key=lambda x: (-x[0], x[1]))
+    xml_items = [entry[2] for entry in prepared_entries]
 
     items_str = "\n".join(xml_items)
     feed_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -419,9 +482,9 @@ def write_feed(items, output_path, is_explicit_feed, extras_map):
 def generate_rss_feeds(out_clean, out_explicit, explicit_list_path, limit):
     print(f"Querying MariaDB replica for spoken articles (Limit: {limit})...")
     raw_records = fetch_spoken_records(limit)
-    print(f"Retrieved {len(raw_records)} media transclusions from database.")
+    print(f"Retrieved {len(raw_records)} distinct media transclusions from database.")
 
-    session = requests.Session()
+    session = create_http_session()
     
     print("Fetching whitelist from Wikipedia:Spoken_articles...")
     all_whitelist, explicit_files, explicit_section_titles = fetch_index_whitelist(session)
@@ -442,16 +505,14 @@ def generate_rss_feeds(out_clean, out_explicit, explicit_list_path, limit):
     filtered_records = filter_and_deduplicate(raw_records, metadata_map, all_whitelist)
     
     unique_articles = list(set([r[0] for r in filtered_records]))
-    print(f"Batch fetching page images and extracts for {len(unique_articles)} articles...")
+    print(f"Batch fetching page images and extracts for {len(unique_articles)} articles (in chunks of 20)...")
     extras_map = batch_fetch_article_extras(unique_articles, session)
 
     clean_items = []
     explicit_items = []
     
-    # Catch strong profanity anywhere in word (e.g., Motherfucker) and start-of-word piss
     profanity_pattern = re.compile(r'(?i)(bitch|shit|fuck|cunt|\bpiss)')
     
-    # Catch unindexed or cross-categorized sexual/anatomical articles
     sexual_topic_pattern = re.compile(
         r'(?i)(\b(penis|penile|vagina|vaginal|penectomy|intercourse|bdsm|bondage|'
         r'fetish|porn|pornography|erotic|masturbat\w*|orgasm|cunnilingus|fellatio|'
@@ -460,7 +521,8 @@ def generate_rss_feeds(out_clean, out_explicit, explicit_list_path, limit):
         r'urethral[_\s]+sounding)'
     )
 
-    for article, audio_file, file_info in filtered_records:
+    for item in filtered_records:
+        article, audio_file, file_info, part_idx, total_parts = item
         is_explicit = False
         norm_audio = normalize_wiki_title(audio_file)
         norm_article_lower = normalize_wiki_title(article).lower()
@@ -480,9 +542,9 @@ def generate_rss_feeds(out_clean, out_explicit, explicit_list_path, limit):
         ):
             is_explicit = True
             
-        explicit_items.append((article, audio_file, file_info))
+        explicit_items.append(item)
         if not is_explicit:
-            clean_items.append((article, audio_file, file_info))
+            clean_items.append(item)
 
     print(f"Classification summary: {len(clean_items)} clean items, {len(explicit_items) - len(clean_items)} explicit-only items excluded from clean feed.")
     write_feed(clean_items, out_clean, False, extras_map)
